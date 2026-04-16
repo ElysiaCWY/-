@@ -9,7 +9,7 @@ mod validate;
 
 use crate::errors::AppError;
 use crate::llm::LlmSettings;
-use crate::schema::{AppSettings, JdRecord, JdScoreResult, ResumeData, ResumeRecord};
+use crate::schema::{AppSettings, JdRecord, JdScoreResult, ParsedResultRecord, ResumeData, ResumeRecord};
 
 #[tauri::command]
 async fn extract_text(file_path: String) -> Result<String, AppError> {
@@ -47,6 +47,11 @@ fn list_resume_library() -> Result<Vec<ResumeRecord>, AppError> {
 }
 
 #[tauri::command]
+fn delete_resume_record(id: String) -> Result<(), AppError> {
+  storage::delete_resume(id)
+}
+
+#[tauri::command]
 fn save_jd_record(title: String, text: String) -> Result<JdRecord, AppError> {
   storage::save_jd(title, text)
 }
@@ -61,6 +66,11 @@ fn load_app_settings() -> Result<AppSettings, AppError> {
   storage::load_settings()
 }
 
+#[tauri::command]
+fn save_parsed_result_json(source_file: String, resume_obj: ResumeData) -> Result<ParsedResultRecord, AppError> {
+  storage::save_parsed_result_json(source_file, resume_obj)
+}
+
 fn main() {
   tauri::Builder::default()
     .invoke_handler(tauri::generate_handler![
@@ -70,9 +80,11 @@ fn main() {
       jd_score_v1,
       save_resume_to_library,
       list_resume_library,
+      delete_resume_record,
       save_jd_record,
       list_jd_records,
-      load_app_settings
+      load_app_settings,
+      save_parsed_result_json
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

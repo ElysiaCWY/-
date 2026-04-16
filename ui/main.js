@@ -23,7 +23,6 @@ function saveDialog(options) {
 const $ = (id) => document.getElementById(id);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-const fileInput = $("fileInput");
 const btnImport = $("btnImport");
 const btnParse = $("btnParse");
 const btnExport = $("btnExport");
@@ -31,14 +30,11 @@ const btnClear = $("btnClear");
 const btnScore = $("btnScore");
 
 const currentFile = $("currentFile");
-const textPreview = $("textPreview");
-const jsonPreview = $("jsonPreview");
+const parseProgressText = $("parseProgressText");
 
 const jdInput = $("jdInput");
 const scoreOut = $("scoreOut");
 const parseQueue = $("parseQueue");
-const basicInfoCard = $("basicInfoCard");
-const skillsTags = $("skillsTags");
 const pageTitle = $("pageTitle");
 const libraryTableBody = $("libraryTableBody");
 const jdList = $("jdList");
@@ -50,6 +46,11 @@ const libraryDegree = $("libraryDegree");
 const libraryYears = $("libraryYears");
 const librarySkill = $("librarySkill");
 const templatePreview = $("templatePreview");
+const resumeDetailContent = $("resumeDetailContent");
+const resumeDetailBasic = $("resumeDetailBasic");
+const resumeDetailWorkBody = $("resumeDetailWorkBody");
+const resumeDetailProjectBody = $("resumeDetailProjectBody");
+const resumeDetailBack = $("resumeDetailBack");
 
 let importedPath = null;
 let selectedQueueIndex = -1;
@@ -72,20 +73,10 @@ const TITLE_MAP = {
   parse: "简历导入 & 解析",
   jd: "JD 管理 & 筛选",
   template: "模板管理",
+  resumeDetail: "简历详情",
 };
 
 const PAGE_KEYS = Object.keys(TITLE_MAP);
-
-function selectedPathsFromInput() {
-  const files = Array.from(fileInput?.files || []);
-  if (!files.length) return [];
-
-  const paths = files
-    .map((f) => (typeof f.path === "string" ? f.path.trim() : ""))
-    .filter(Boolean);
-
-  return paths;
-}
 
 function switchPage(page, syncHash = true) {
   const target = PAGE_KEYS.includes(page) ? page : "dashboard";
@@ -126,26 +117,8 @@ function bindQuickActions() {
   $("gotoParse")?.addEventListener("click", () => jumpToStandalonePage("parse"));
   $("gotoJd")?.addEventListener("click", () => jumpToStandalonePage("jd"));
   $("gotoTemplate")?.addEventListener("click", () => jumpToStandalonePage("template"));
+  resumeDetailBack?.addEventListener("click", () => jumpToStandalonePage("library"));
 
-  $("btnReparse")?.addEventListener("click", () => btnParse.click());
-  $("btnSaveLibrary")?.addEventListener("click", async () => {
-    try {
-      if (!lastResumeObj) {
-        alert("请先完成解析，再保存到简历库。");
-        return;
-      }
-      await invoke("save_resume_to_library", {
-        sourceFile: importedPath || "manual-input",
-        resumeObj: lastResumeObj,
-      });
-      await refreshLibraryAndStats();
-      alert("已保存到简历库。");
-      jumpToStandalonePage("library");
-    } catch (e) {
-      alert(String(e));
-    }
-  });
-  $("btnGenerateResume")?.addEventListener("click", () => jumpToStandalonePage("template"));
   $("btnNewJd")?.addEventListener("click", async () => {
     const title = window.prompt("请输入 JD 标题：");
     if (!title) return;
@@ -221,33 +194,168 @@ async function loadSettingsFromFile() {
 }
 
 function setBusy(b) {
-  btnImport.disabled = b;
-  btnParse.disabled = b;
-  btnExport.disabled = b;
-  btnScore.disabled = b;
+  if (btnImport) btnImport.disabled = b;
+  if (btnParse) btnParse.disabled = b;
+  if (btnExport) btnExport.disabled = b;
+  if (btnScore) btnScore.disabled = b;
+  if (btnClear) btnClear.disabled = b;
 }
 
 function renderLibraryTable(records) {
   if (!records.length) {
-    libraryTableBody.innerHTML = '<tr><td colspan="7" class="muted">暂无简历数据</td></tr>';
+    libraryTableBody.innerHTML = '<tr><td colspan="9" class="muted">暂无简历数据</td></tr>';
     return;
   }
   libraryTableBody.innerHTML = records
     .map((r) => {
       const b = r.data?.basicInfo || {};
       const edu = b.education?.[0]?.degree || "";
-      const skills = (b.skills || []).slice(0, 3).join(", ");
+      const latestWork = r.data?.workExperience?.["1"] || {};
+      const workYears = calcWorkYears(r.data?.workExperience || {});
+      const importedDate = formatDateFromEpoch(r.createdAt || r.created_at || "");
       return `<tr>
         <td>${b.name || "-"}</td>
         <td>${b.gender || "-"}</td>
         <td>${b.age || "-"}</td>
         <td>${edu || "-"}</td>
-        <td>${skills || "-"}</td>
-        <td>-</td>
-        <td>查看详情</td>
+        <td>${latestWork.position || "-"}</td>
+        <td>${workYears}</td>
+        <td>${importedDate}</td>
+        <td><button class="library-detail-btn" data-id="${r.id}">查看详情</button></td>
+        <td><button class="ghost library-delete-btn" data-id="${r.id}">删除</button></td>
       </tr>`;
     })
     .join("");
+
+  $$(".library-detail-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.id;
+      const rec = libraryRecords.find((x) => x.id === id);
+      if (!rec) return;
+      renderResumeDetailPage(rec);
+      jumpToStandalonePage("resumeDetail");
+    });
+  });
+
+  $$(".library-delete-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      if (!id) return;
+      const ok = window.confirm("确认删除该简历记录吗？此操作不可恢复。");
+      if (!ok) return;
+      try {
+        await invoke("delete_resume_record", { id });
+        await refreshLibraryAndStats();
+      } catch (e) {
+        alert(String(e));
+      }
+    });
+  });
+}
+
+function formatDateFromEpoch(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return "-";
+  const d = new Date(n * 1000);
+  if (Number.isNaN(d.getTime())) return "-";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function parsePeriodStart(period) {
+  const m = String(period || "").match(/(\d{4})\.(\d{1,2})/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mon = Number(m[2]);
+  if (!Number.isFinite(y) || !Number.isFinite(mon)) return null;
+  return { y, mon };
+}
+
+function calcWorkYears(workExp) {
+  const items = Object.values(workExp || {});
+  const starts = items
+    .map((x) => parsePeriodStart(x?.period))
+    .filter(Boolean)
+    .sort((a, b) => (a.y - b.y) || (a.mon - b.mon));
+
+  if (!starts.length) return "-";
+
+  const start = starts[0];
+  const now = new Date();
+  const months = (now.getFullYear() - start.y) * 12 + (now.getMonth() + 1 - start.mon);
+  const years = Math.max(0, months / 12);
+  if (years < 1) return "1年以下";
+  return `${years.toFixed(1)}年`;
+}
+
+function escapeHtml(v) {
+  return String(v ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function renderResumeDetailPage(rec) {
+  if (!resumeDetailContent || !resumeDetailBasic || !resumeDetailWorkBody || !resumeDetailProjectBody) return;
+
+  const b = rec?.data?.basicInfo || {};
+  const edu = b.education?.[0] || {};
+  const work = rec?.data?.workExperience || {};
+  const proj = rec?.data?.projectExperience || {};
+
+  const basicItems = [
+    ["姓名", b.name || "-"],
+    ["性别", b.gender || "-"],
+    ["年龄", b.age || "-"],
+    ["最高学历", edu.degree || "-"],
+    ["毕业院校", edu.school || "-"],
+    ["毕业时间", edu.graduationDate || "-"],
+    ["目标岗位", work?.["1"]?.position || "-"],
+    ["工作年限", calcWorkYears(work)],
+    ["导入日期", formatDateFromEpoch(rec.createdAt || rec.created_at || "")],
+    ["技能标签", (b.skills || []).join("、") || "-"],
+  ];
+
+  resumeDetailBasic.innerHTML = basicItems
+    .map(([k, v]) => `<div class="detail-item"><span class="detail-k">${escapeHtml(k)}</span><span class="detail-v">${escapeHtml(v)}</span></div>`)
+    .join("");
+
+  const workRows = Object.keys(work)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => work[k] || {});
+
+  if (!workRows.length) {
+    resumeDetailWorkBody.innerHTML = '<tr><td colspan="4" class="muted">暂无工作经历</td></tr>';
+  } else {
+    resumeDetailWorkBody.innerHTML = workRows
+      .map((w) => `<tr>
+        <td>${escapeHtml(w.period || "-")}</td>
+        <td>${escapeHtml(w.company || "-")}</td>
+        <td>${escapeHtml(w.position || "-")}</td>
+        <td>${escapeHtml(w.description || "-")}</td>
+      </tr>`)
+      .join("");
+  }
+
+  const projectRows = Object.keys(proj)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => proj[k] || {});
+
+  if (!projectRows.length) {
+    resumeDetailProjectBody.innerHTML = '<tr><td colspan="3" class="muted">暂无项目经历</td></tr>';
+  } else {
+    resumeDetailProjectBody.innerHTML = projectRows
+      .map((p) => `<tr>
+        <td>${escapeHtml(p.projectName || "-")}</td>
+        <td>${escapeHtml(p.projectDescription || "-")}</td>
+        <td>${escapeHtml(p.projectAchievements || "-")}</td>
+      </tr>`)
+      .join("");
+  }
 }
 
 function applyLibraryFilters() {
@@ -325,57 +433,27 @@ async function refreshJdList() {
 
 function renderQueueTable() {
   if (!importQueue.length) {
-    parseQueue.innerHTML = '<tr><td colspan="4" class="muted">暂无任务</td></tr>';
+    parseQueue.innerHTML = '<tr><td colspan="2" class="muted">暂无任务</td></tr>';
+    if (parseProgressText) parseProgressText.textContent = "0/0 (0%)";
     return;
   }
+
+  const done = importQueue.filter((x) => x.status === "已完成" || x.status === "需修正").length;
+  const total = importQueue.length;
+  const percent = Math.round((done / total) * 100);
+  if (parseProgressText) {
+    parseProgressText.textContent = `${done}/${total} (${percent}%)`;
+  }
+
   parseQueue.innerHTML = importQueue
-    .map((item, idx) => {
+    .map((item) => {
       const status = item.status || "待解析";
-      const mode = item.mode || "规则";
       return `<tr>
         <td>${item.fileName}</td>
         <td>${status}</td>
-        <td>${mode}</td>
-        <td>
-          <button class="queue-view-btn" data-idx="${idx}">查看结果</button>
-          <button class="queue-use-btn" data-idx="${idx}">设为当前</button>
-        </td>
       </tr>`;
     })
     .join("");
-
-  $$(".queue-view-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const idx = Number(btn.dataset.idx);
-      const item = importQueue[idx];
-      if (!item) return;
-      if (item.error) {
-        alert(item.error);
-        return;
-      }
-      textPreview.value = item.text || "";
-      currentFile.textContent = item.filePath;
-      importedPath = item.filePath;
-      selectedQueueIndex = idx;
-    });
-  });
-
-  $$(".queue-use-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const idx = Number(btn.dataset.idx);
-      const item = importQueue[idx];
-      if (!item) return;
-      if (item.error) {
-        alert("该文件抽取失败，请先修正后再解析。");
-        return;
-      }
-      textPreview.value = item.text || "";
-      currentFile.textContent = item.filePath;
-      importedPath = item.filePath;
-      selectedQueueIndex = idx;
-      alert(`已切换当前文件：${item.fileName}`);
-    });
-  });
 }
 
 function renderStructuredCards(resume) {
@@ -486,7 +564,7 @@ async function handleImportClick() {
       filePath,
       fileName: filePath.split(/[\\/]/).pop() || filePath,
       status: "解析中",
-      mode: "规则",
+      progress: 0,
       text: "",
       error: "",
     }));
@@ -498,9 +576,11 @@ async function handleImportClick() {
         const extracted = await invoke("extract_text", { filePath: item.filePath });
         item.text = extracted || "";
         item.status = "待解析";
+        item.progress = 25;
       } catch (err) {
         item.error = String(err);
         item.status = "需修正";
+        item.progress = 100;
       }
       renderQueueTable();
     }
@@ -512,11 +592,9 @@ async function handleImportClick() {
       selectedQueueIndex = firstOk;
       importedPath = importQueue[firstOk].filePath;
       currentFile.textContent = importedPath;
-      textPreview.value = importQueue[firstOk].text || "";
     } else {
       importedPath = null;
       currentFile.textContent = "未选择";
-      textPreview.value = "";
     }
 
     if (failCount === 0) {
@@ -559,33 +637,57 @@ btnParse.addEventListener("click", async () => {
       alert("请先在项目根目录 app-config.json 中配置 llamaCliPath 和 modelPath");
       return;
     }
-    const text = textPreview.value.trim();
-    if (!text) {
-      alert("没有可解析的文本。请先导入并抽取文本。");
+    const pending = importQueue.filter((x) => !x.error && x.text && x.status !== "已完成");
+    if (!pending.length) {
+      alert("没有可解析任务。请先导入并抽取文本。");
       return;
     }
-    const parsed = await invoke("parse_resume", { text, settings: settings() });
-    lastResumeObj = parsed;
-    jsonPreview.textContent = JSON.stringify(parsed, null, 2);
-    renderStructuredCards(parsed);
-    if (selectedQueueIndex >= 0 && importQueue[selectedQueueIndex]) {
-      importQueue[selectedQueueIndex].status = "已完成";
-      importQueue[selectedQueueIndex].mode = "模型";
+
+    let okCount = 0;
+    let failCount = 0;
+    for (const item of importQueue) {
+      if (item.error || !item.text || item.status === "已完成") continue;
+      item.status = "解析中";
+      item.progress = 60;
+      renderQueueTable();
+      currentFile.textContent = item.filePath;
+
+      try {
+        const parsed = await invoke("parse_resume", { text: item.text, settings: settings() });
+        lastResumeObj = parsed;
+
+        await invoke("save_resume_to_library", {
+          sourceFile: item.filePath || "manual-input",
+          resumeObj: parsed,
+        });
+
+        await invoke("save_parsed_result_json", {
+          sourceFile: item.filePath || "manual-input",
+          resumeObj: parsed,
+        });
+
+        item.status = "已完成";
+        item.progress = 100;
+        okCount += 1;
+      } catch (e) {
+        item.error = String(e);
+        item.status = "需修正";
+        item.progress = 100;
+        failCount += 1;
+      }
       renderQueueTable();
     }
+
+    await refreshLibraryAndStats();
+    alert(`批量解析完成：成功 ${okCount}，失败 ${failCount}`);
   } catch (e) {
     alert(String(e));
-    if (selectedQueueIndex >= 0 && importQueue[selectedQueueIndex]) {
-      importQueue[selectedQueueIndex].status = "需修正";
-      importQueue[selectedQueueIndex].mode = "模型";
-      renderQueueTable();
-    }
   } finally {
     setBusy(false);
   }
 });
 
-btnExport.addEventListener("click", async () => {
+btnExport?.addEventListener("click", async () => {
   try {
     setBusy(true);
     if (!lastResumeObj) {
@@ -634,11 +736,7 @@ btnClear.addEventListener("click", () => {
   importQueue = [];
   lastResumeObj = null;
   currentFile.textContent = "未选择";
-  textPreview.value = "";
-  jsonPreview.textContent = "";
   renderQueueTable();
-  basicInfoCard.textContent = "暂无";
-  skillsTags.innerHTML = "";
   jdInput.value = "";
   scoreOut.textContent = "";
 });

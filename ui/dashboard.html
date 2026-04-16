@@ -69,10 +69,11 @@
         <section class="page" data-page="parse">
           <section class="card">
             <h2>导入区</h2>
-            <p class="subtext">支持 doc / docx / pdf / png / jpg，可拖拽多个文件（当前版本先单文件解析）。</p>
+            <p class="subtext">支持 doc / docx / pdf / png / jpg，导入后按队列批量解析。</p>
             <div class="row">
-              <input id="fileInput" type="file" multiple accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" />
               <button id="btnImport" class="primary">批量导入并抽取文本</button>
+              <button id="btnParse" class="primary">开始批量解析</button>
+              <button id="btnClear" class="ghost">清空</button>
             </div>
             <div class="row">
               <span class="muted">当前文件：</span><span id="currentFile" class="mono">未选择</span>
@@ -82,38 +83,16 @@
 
           <section class="card">
             <h2>解析队列</h2>
+            <div class="row">
+              <span class="muted">解析进度：</span>
+              <span id="parseProgressText" class="mono">0/0 (0%)</span>
+            </div>
             <table class="table">
-              <thead><tr><th>文件名</th><th>解析状态</th><th>解析方式</th><th>操作</th></tr></thead>
+              <thead><tr><th>文件名</th><th>解析进度</th></tr></thead>
               <tbody id="parseQueue">
-                <tr><td colspan="4" class="muted">暂无任务</td></tr>
+                <tr><td colspan="2" class="muted">暂无任务</td></tr>
               </tbody>
             </table>
-          </section>
-
-          <section class="card">
-            <h2>解析结果预览</h2>
-            <div class="grid-3">
-              <textarea id="textPreview" placeholder="抽取文本预览…" spellcheck="false"></textarea>
-              <pre id="jsonPreview" class="pre"></pre>
-              <div class="result-cards">
-                <div class="mini-card">
-                  <h3>基础信息</h3>
-                  <div id="basicInfoCard" class="mini-body muted">暂无</div>
-                </div>
-                <div class="mini-card">
-                  <h3>技能标签</h3>
-                  <div id="skillsTags" class="tags"></div>
-                </div>
-              </div>
-            </div>
-            <div class="row">
-              <button id="btnParse" class="primary">开始解析</button>
-              <button id="btnSaveLibrary">保存到简历库</button>
-              <button id="btnGenerateResume">生成标准简历</button>
-              <button id="btnReparse">重新解析</button>
-              <button id="btnExport" class="primary">导出 `resume_data.js`</button>
-              <button id="btnClear" class="ghost">清空</button>
-            </div>
           </section>
         </section>
 
@@ -144,9 +123,42 @@
           <section class="card">
             <h2>简历列表</h2>
             <table class="table">
-              <thead><tr><th>姓名</th><th>性别</th><th>年龄</th><th>最高学历</th><th>技能</th><th>匹配度</th><th>操作</th></tr></thead>
-              <tbody id="libraryTableBody"><tr><td colspan="7" class="muted">暂无简历数据</td></tr></tbody>
+              <thead><tr><th>姓名</th><th>性别</th><th>年龄</th><th>最高学历</th><th>岗位</th><th>工作年限</th><th>导入日期</th><th>查看详情</th><th>删除</th></tr></thead>
+              <tbody id="libraryTableBody"><tr><td colspan="9" class="muted">暂无简历数据</td></tr></tbody>
             </table>
+          </section>
+        </section>
+
+        <section class="page" data-page="resumeDetail">
+          <section class="card">
+            <div class="row" style="justify-content: space-between; align-items: center;">
+              <h2 style="margin: 0;">简历详情</h2>
+              <button id="resumeDetailBack" class="ghost">返回简历库</button>
+            </div>
+          </section>
+          <section id="resumeDetailContent" class="detail-layout">
+            <section class="card detail-card">
+              <h2>基础信息</h2>
+              <div id="resumeDetailBasic" class="detail-grid muted">请选择简历查看详情。</div>
+            </section>
+            <section class="card detail-card">
+              <h2>工作经历</h2>
+              <table class="table detail-table">
+                <thead>
+                  <tr><th>期间</th><th>公司</th><th>岗位</th><th>职责描述</th></tr>
+                </thead>
+                <tbody id="resumeDetailWorkBody"><tr><td colspan="4" class="muted">暂无工作经历</td></tr></tbody>
+              </table>
+            </section>
+            <section class="card detail-card">
+              <h2>项目经历</h2>
+              <table class="table detail-table">
+                <thead>
+                  <tr><th>项目名称</th><th>项目描述</th><th>项目成果</th></tr>
+                </thead>
+                <tbody id="resumeDetailProjectBody"><tr><td colspan="3" class="muted">暂无项目经历</td></tr></tbody>
+              </table>
+            </section>
           </section>
         </section>
 

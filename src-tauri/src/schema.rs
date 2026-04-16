@@ -74,6 +74,18 @@ pub struct JdRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ParsedResultRecord {
+  pub id: String,
+  pub created_at: String,
+  #[serde(default)]
+  pub imported_date: String,
+  pub source_file: String,
+  pub candidate_name: String,
+  pub json_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppSettings {
   pub llama_cli_path: String,
   pub model_path: String,
@@ -87,7 +99,7 @@ impl Default for AppSettings {
       llama_cli_path: String::new(),
       model_path: String::new(),
       threads: 4,
-      temperature: 0.1,
+      temperature: 0.0,
     }
   }
 }

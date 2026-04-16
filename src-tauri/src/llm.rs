@@ -34,33 +34,84 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
   })?;
   let tpl_for_prompt = template_for_prompt(&tpl_content);
 
-  let prompt = format!(
-    r#"解析简历，只输出 JSON，不展示思考过程，不要输出 js 文件内容。
+  // 第一阶段：先抽取稳定结构（公司/职位/时间段/项目名称等骨架信息）
+  let stage1_prompt = build_stage1_prompt(&tpl_for_prompt, text);
+  let stage1_json = run_ollama_json(&stage1_prompt, settings)?;
+  let stage1_data = parse_resume_data_flexible(&stage1_json).map_err(|e| {
+    AppError::msg(format!(
+      "第一阶段反序列化失败：{}\nJSON原文：{}",
+      e,
+      clip(&stage1_json, 1200)
+    ))
+  })?;
+
+  // 第二阶段：基于第一阶段骨架补全描述细节，提升内容质量
+  let stage1_seed = serde_json::to_string_pretty(&stage1_data)
+    .unwrap_or_else(|_| stage1_json.clone());
+  let stage2_prompt = build_stage2_prompt(&tpl_for_prompt, text, &stage1_seed);
+
+  let final_data = match run_ollama_json(&stage2_prompt, settings)
+    .and_then(|json| {
+      parse_resume_data_flexible(&json).map_err(AppError::msg)
+    }) {
+    Ok(v) => v,
+    // 第二阶段失败时回退第一阶段结果，避免解析流程整体失败。
+    Err(_) => stage1_data,
+  };
+
+  Ok(final_data)
+}
+
+fn build_stage1_prompt(tpl: &str, text: &str) -> String {
+  format!(
+    r#"解析简历（第一阶段：结构抽取），只输出 JSON。
 
 下面是字段结构模板（JSON）：
 ```json
 {tpl}
 ```
-请按照上面的字段结构输出一个标准 JSON 对象。
+
+要求：
+1. 严格按模板字段输出，不要新增或删除字段。
+2. 工作经历与项目经历要尽量完整枚举，按时间倒序。
+3. 本阶段优先保证结构完整和分段正确，description/projectAchievements 可简写。
+4. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+
 简历内容：
 """{text}""""#,
-  tpl = tpl_for_prompt,
+    tpl = tpl,
     text = text
-  );
-
-  let json_res = run_ollama_json(&prompt, settings, 6000)?;
-  let merged = parse_resume_data_flexible(&json_res).map_err(|e| {
-    AppError::msg(format!(
-      "反序列化大模型结果失败：{}\nJSON原文：{}",
-      e,
-      clip(&json_res, 1200)
-    ))
-  })?;
-
-  Ok(merged)
+  )
 }
 
-fn run_ollama_json(prompt: &str, settings: &LlmSettings, max_tokens: i32) -> Result<String, AppError> {
+fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
+  format!(
+    r#"解析简历（第二阶段：细节补全），只输出 JSON。
+
+下面是字段结构模板（JSON）：
+```json
+{tpl}
+```
+
+下面是第一阶段结果（结构骨架），请在不破坏结构的前提下补全内容：
+```json
+{seed}
+```
+
+要求：
+1. 保持 workExperience / projectExperience 的条目结构，不要把多段经历合并成一段。
+2. 可补充 description / projectDescription / projectAchievements 的细节，但不要编造不存在的公司/项目。
+3. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+
+简历内容：
+"""{text}""""#,
+    tpl = tpl,
+    seed = stage1_seed,
+    text = text
+  )
+}
+
+fn run_ollama_json(prompt: &str, settings: &LlmSettings) -> Result<String, AppError> {
   let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
   let endpoint = format!("{}/api/generate", base_url);
 
@@ -71,7 +122,6 @@ fn run_ollama_json(prompt: &str, settings: &LlmSettings, max_tokens: i32) -> Res
     "stream": false,
     "options": {
       "temperature": settings.temperature,
-      "num_predict": max_tokens,
       "num_ctx": 8000,
       "num_thread": settings.threads,
     }

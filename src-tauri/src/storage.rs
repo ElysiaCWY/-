@@ -1,8 +1,9 @@
 use crate::errors::AppError;
-use crate::schema::{AppSettings, JdRecord, ResumeData, ResumeRecord};
+use crate::schema::{AppSettings, JdRecord, ParsedResultRecord, ResumeData, ResumeRecord};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 fn data_dir() -> Result<PathBuf, AppError> {
   let base = dirs::data_local_dir().ok_or_else(|| AppError::msg("无法获取本地数据目录"))?;
@@ -19,6 +20,18 @@ fn resumes_path() -> Result<PathBuf, AppError> {
 
 fn jd_path() -> Result<PathBuf, AppError> {
   Ok(data_dir()?.join("jds.json"))
+}
+
+fn parsed_results_dir() -> Result<PathBuf, AppError> {
+  let dir = data_dir()?.join("parsed-results");
+  if !dir.exists() {
+    fs::create_dir_all(&dir)?;
+  }
+  Ok(dir)
+}
+
+fn parsed_index_path() -> Result<PathBuf, AppError> {
+  Ok(parsed_results_dir()?.join("parsed-index.json"))
 }
 
 fn find_in_ancestors(start: &Path, file_name: &str, max_depth: usize) -> Option<PathBuf> {
@@ -120,6 +133,52 @@ fn make_id(prefix: &str) -> String {
   format!("{prefix}-{}", now_epoch())
 }
 
+fn today_ymd() -> String {
+  let now = OffsetDateTime::now_utc();
+  let d = now.date();
+  format!("{:04}-{:02}-{:02}", d.year(), d.month() as u8, d.day())
+}
+
+fn sanitize_filename(input: &str) -> String {
+  let trimmed = input.trim();
+  if trimmed.is_empty() {
+    return "candidate".to_string();
+  }
+
+  let mut out = String::with_capacity(trimmed.len());
+  for ch in trimmed.chars() {
+    let bad = matches!(ch, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
+    if bad {
+      out.push('_');
+    } else {
+      out.push(ch);
+    }
+  }
+
+  let collapsed = out.trim_matches('.').trim();
+  if collapsed.is_empty() {
+    "candidate".to_string()
+  } else {
+    collapsed.to_string()
+  }
+}
+
+fn unique_json_path(base_dir: &Path, base_name: &str) -> PathBuf {
+  let direct = base_dir.join(format!("{}.json", base_name));
+  if !direct.exists() {
+    return direct;
+  }
+
+  for i in 2..10000 {
+    let candidate = base_dir.join(format!("{}_{}.json", base_name, i));
+    if !candidate.exists() {
+      return candidate;
+    }
+  }
+
+  base_dir.join(format!("{}_{}.json", base_name, now_epoch()))
+}
+
 pub fn list_resumes() -> Result<Vec<ResumeRecord>, AppError> {
   let path = resumes_path()?;
   let mut items: Vec<ResumeRecord> = read_json_or_default(&path)?;
@@ -139,6 +198,18 @@ pub fn save_resume(source_file: String, data: ResumeData) -> Result<ResumeRecord
   items.push(record.clone());
   write_json(&path, &items)?;
   Ok(record)
+}
+
+pub fn delete_resume(id: String) -> Result<(), AppError> {
+  let path = resumes_path()?;
+  let mut items: Vec<ResumeRecord> = read_json_or_default(&path)?;
+  let before = items.len();
+  items.retain(|x| x.id != id);
+  if items.len() == before {
+    return Err(AppError::msg("未找到要删除的简历记录"));
+  }
+  write_json(&path, &items)?;
+  Ok(())
 }
 
 pub fn list_jds() -> Result<Vec<JdRecord>, AppError> {
@@ -180,5 +251,29 @@ pub fn load_settings() -> Result<AppSettings, AppError> {
     }
   }
   Ok(settings)
+}
+
+pub fn save_parsed_result_json(source_file: String, data: ResumeData) -> Result<ParsedResultRecord, AppError> {
+  let dir = parsed_results_dir()?;
+  let index_path = parsed_index_path()?;
+
+  let candidate_name = data.basic_info.name.trim().to_string();
+  let file_base = sanitize_filename(&candidate_name);
+  let json_path = unique_json_path(&dir, &file_base);
+
+  write_json(&json_path, &data)?;
+
+  let mut items: Vec<ParsedResultRecord> = read_json_or_default(&index_path)?;
+  let record = ParsedResultRecord {
+    id: make_id("parsed"),
+    created_at: now_epoch().to_string(),
+    imported_date: today_ymd(),
+    source_file,
+    candidate_name,
+    json_path: json_path.to_string_lossy().to_string(),
+  };
+  items.push(record.clone());
+  write_json(&index_path, &items)?;
+  Ok(record)
 }
 

@@ -3,9 +3,63 @@ use std::collections::BTreeMap;
 
 pub fn normalize_resume(mut r: ResumeData) -> ResumeData {
   r.basic_info = normalize_basic(r.basic_info);
-  r.work_experience = normalize_indexed_map(r.work_experience, WorkItem::default());
+  r.work_experience = normalize_work_experience(r.work_experience);
   r.project_experience = normalize_indexed_map(r.project_experience, ProjectItem::default());
   r
+}
+
+fn normalize_work_experience(m: BTreeMap<String, WorkItem>) -> BTreeMap<String, WorkItem> {
+  let mut ordered: Vec<(usize, WorkItem)> = Vec::new();
+  for (k, v) in m {
+    let idx = k.parse::<usize>().unwrap_or(9999);
+    ordered.push((idx, v));
+  }
+  ordered.sort_by_key(|(idx, _)| *idx);
+
+  let mut merged: Vec<WorkItem> = Vec::new();
+  for (_, item) in ordered {
+    let item = WorkItem {
+      company: item.company.trim().to_string(),
+      position: item.position.trim().to_string(),
+      period: item.period.trim().to_string(),
+      description: item.description.trim().to_string(),
+    };
+
+    if let Some(existing) = merged.iter_mut().find(|w| {
+      w.company == item.company && w.position == item.position && w.period == item.period
+    }) {
+      existing.description = merge_description(&existing.description, &item.description);
+    } else {
+      merged.push(item);
+    }
+  }
+
+  let mut out: BTreeMap<String, WorkItem> = BTreeMap::new();
+  if merged.is_empty() {
+    out.insert("1".to_string(), WorkItem::default());
+    return out;
+  }
+
+  for (i, item) in merged.into_iter().enumerate() {
+    out.insert((i + 1).to_string(), item);
+  }
+  out
+}
+
+fn merge_description(a: &str, b: &str) -> String {
+  if a.is_empty() {
+    return b.to_string();
+  }
+  if b.is_empty() {
+    return a.to_string();
+  }
+  if a.contains(b) {
+    return a.to_string();
+  }
+  if b.contains(a) {
+    return b.to_string();
+  }
+  format!("{}\n{}", a, b)
 }
 
 fn normalize_basic(mut b: BasicInfo) -> BasicInfo {
