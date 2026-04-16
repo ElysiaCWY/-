@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>简历管理平台</title>
+    <link rel="icon" href="data:;base64,=">
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-title">ResumeDesk</div>
+          <div class="brand-sub">简历管理工作台</div>
+        </div>
+        <nav class="nav">
+          <a class="nav-item active" data-page="dashboard" href="#dashboard">首页概览</a>
+          <a class="nav-item" data-page="library" href="#library">简历库</a>
+          <a class="nav-item" data-page="parse" href="#parse">导入与解析</a>
+          <a class="nav-item" data-page="jd" href="#jd">JD 管理筛选</a>
+          <a class="nav-item" data-page="template" href="#template">模板生成</a>
+        </nav>
+      </aside>
+
+      <section class="main">
+        <header class="topbar">
+          <div>
+            <h1 id="pageTitle">首页概览</h1>
+            <p class="subtext">Windows 本地版 · 数据不出本机 · 低配优先</p>
+          </div>
+          <div class="top-actions">
+            <button id="quickImport" class="primary">导入简历</button>
+            <button id="quickNewJd">新建 JD</button>
+            <button id="quickBatchParse">批量解析</button>
+            <button id="quickExport">导出结果</button>
+          </div>
+        </header>
+
+        <section class="page active" data-page="dashboard">
+          <div class="stats">
+            <article class="card stat"><div class="k">总简历数</div><div id="statTotal" class="v">0</div></article>
+            <article class="card stat"><div class="k">今日导入</div><div id="statToday" class="v">0</div></article>
+            <article class="card stat"><div class="k">待解析</div><div id="statPending" class="v">0</div></article>
+            <article class="card stat"><div class="k">匹配中简历</div><div id="statMatching" class="v">0</div></article>
+          </div>
+
+          <div class="grid-2">
+            <section class="card">
+              <h2>最近导入</h2>
+              <table class="table">
+                <thead><tr><th>姓名</th><th>电话</th><th>岗位</th><th>解析状态</th></tr></thead>
+                <tbody id="recentList">
+                  <tr><td colspan="4" class="muted">暂无数据</td></tr>
+                </tbody>
+              </table>
+            </section>
+            <section class="card">
+              <h2>快捷入口</h2>
+              <div class="stack">
+                <button id="gotoParse" class="primary">导入简历</button>
+                <button id="gotoJd">新建 JD</button>
+                <button id="gotoTemplate">生成标准简历</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page" data-page="parse">
+          <section class="card">
+            <h2>导入区</h2>
+            <p class="subtext">支持 doc / docx / pdf / png / jpg，可拖拽多个文件（当前版本先单文件解析）。</p>
+            <div class="row">
+              <input id="fileInput" type="file" multiple accept=".pdf,.docx,.doc,.png,.jpg,.jpeg,.webp" />
+              <button id="btnImport" class="primary">批量导入并抽取文本</button>
+            </div>
+            <div class="row">
+              <span class="muted">当前文件：</span><span id="currentFile" class="mono">未选择</span>
+            </div>
+            <p class="small subtext">隐私提示：全程本地处理，不上传云端。</p>
+          </section>
+
+          <section class="card">
+            <h2>解析队列</h2>
+            <table class="table">
+              <thead><tr><th>文件名</th><th>解析状态</th><th>解析方式</th><th>操作</th></tr></thead>
+              <tbody id="parseQueue">
+                <tr><td colspan="4" class="muted">暂无任务</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <section class="card">
+            <h2>解析结果预览</h2>
+            <div class="grid-3">
+              <textarea id="textPreview" placeholder="抽取文本预览…" spellcheck="false"></textarea>
+              <pre id="jsonPreview" class="pre"></pre>
+              <div class="result-cards">
+                <div class="mini-card">
+                  <h3>基础信息</h3>
+                  <div id="basicInfoCard" class="mini-body muted">暂无</div>
+                </div>
+                <div class="mini-card">
+                  <h3>技能标签</h3>
+                  <div id="skillsTags" class="tags"></div>
+                </div>
+              </div>
+            </div>
+            <div class="row">
+              <button id="btnParse" class="primary">开始解析</button>
+              <button id="btnSaveLibrary">保存到简历库</button>
+              <button id="btnGenerateResume">生成标准简历</button>
+              <button id="btnReparse">重新解析</button>
+              <button id="btnExport" class="primary">导出 `resume_data.js`</button>
+              <button id="btnClear" class="ghost">清空</button>
+            </div>
+          </section>
+        </section>
+
+        <section class="page" data-page="library">
+          <section class="card">
+            <h2>简历库筛选</h2>
+            <div class="filters">
+              <input id="libraryKeyword" placeholder="关键词搜索（姓名/技能/岗位）" />
+              <select id="libraryDegree">
+                <option value="">学历筛选（全部）</option>
+                <option>大专</option>
+                <option>本科</option>
+                <option>硕士</option>
+                <option>博士</option>
+              </select>
+              <select id="libraryYears">
+                <option value="">工作年限（全部）</option>
+                <option value="0">0-1年</option>
+                <option value="2">2-3年</option>
+                <option value="4">4-6年</option>
+                <option value="7">7年以上</option>
+              </select>
+              <input id="librarySkill" placeholder="技能标签（如：Python）" />
+              <button id="libraryFilterBtn">筛选</button>
+              <button id="libraryResetBtn" class="ghost">重置</button>
+            </div>
+          </section>
+          <section class="card">
+            <h2>简历列表</h2>
+            <table class="table">
+              <thead><tr><th>姓名</th><th>性别</th><th>年龄</th><th>最高学历</th><th>技能</th><th>匹配度</th><th>操作</th></tr></thead>
+              <tbody id="libraryTableBody"><tr><td colspan="7" class="muted">暂无简历数据</td></tr></tbody>
+            </table>
+          </section>
+        </section>
+
+        <section class="page" data-page="jd">
+          <div class="grid-2">
+            <section class="card">
+              <h2>JD 列表</h2>
+              <button id="btnNewJd" class="primary">新建 JD</button>
+              <ul id="jdList" class="list muted"><li>暂无 JD</li></ul>
+            </section>
+            <section class="card">
+              <h2>智能筛选</h2>
+              <div class="row">
+                <label><input type="radio" name="mode" checked /> 关键词匹配（规则快筛）</label>
+                <label><input type="radio" name="mode" /> 模型深度匹配（本地 QwenPaw）</label>
+              </div>
+              <textarea id="jdInput" placeholder="粘贴 JD 文本…" spellcheck="false"></textarea>
+              <div class="row">
+                <button id="btnScore" class="primary">计算匹配分</button>
+                <span id="scoreOut" class="mono muted"></span>
+              </div>
+              <div class="mini-card">
+                <h3>匹配结果（按匹配度排序）</h3>
+                <table class="table">
+                  <thead><tr><th>姓名</th><th>匹配关键词</th><th>匹配分</th></tr></thead>
+                  <tbody id="jdResultTable">
+                    <tr><td colspan="3" class="muted">暂无匹配结果</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="row">
+                <button id="jdExportBtn">导出名单</button><button id="jdViewResumeBtn">查看简历</button><button id="jdCompareBtn">生成对比报告</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="page" data-page="template">
+          <section class="card">
+            <h2>标准简历模板生成</h2>
+            <div class="row">
+              <select id="tplName"><option>简约版</option><option>详细版</option><option>企业版</option></select>
+              <select id="tplLength"><option>精简</option><option selected>标准</option><option>详细</option></select>
+            </div>
+            <div class="row">
+              <label><input id="tplEdu" type="checkbox" checked /> 教育经历</label>
+              <label><input id="tplProject" type="checkbox" checked /> 项目经历</label>
+              <label><input id="tplCert" type="checkbox" /> 证书</label>
+              <label><input id="tplSelf" type="checkbox" /> 自我评价</label>
+            </div>
+            <div class="mini-card">
+              <h3>模板预览</h3>
+              <pre id="templatePreview" class="pre">请先在“简历导入 & 解析”完成解析，再来此页面生成预览。</pre>
+            </div>
+            <div class="row">
+              <button id="tplExportWord">导出 Word</button><button id="tplExportPdf">导出 PDF</button><button id="tplRegenerate">重新生成</button>
+            </div>
+          </section>
+        </section>
+
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

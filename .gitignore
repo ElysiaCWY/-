@@ -1,0 +1,21 @@
+# Node
+node_modules/
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+**/*.rs.bk
+
+# Local model and runtime binaries
+model/
+llama-b8797-bin-win-cpu-x64/
+*.gguf
+*.zip
+
+# Local app/runtime config and logs
+app-config.json
+*.log
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
