@@ -68,6 +68,30 @@ fn absolutize_config_path(raw: &str, base_dir: &Path) -> String {
   base_dir.join(p).to_string_lossy().to_string()
 }
 
+fn is_http_url(s: &str) -> bool {
+  let v = s.trim().to_ascii_lowercase();
+  v.starts_with("http://") || v.starts_with("https://")
+}
+
+fn should_absolutize_llama_cli_path(raw: &str) -> bool {
+  let v = raw.trim();
+  if v.is_empty() || is_http_url(v) {
+    return false;
+  }
+  let lower = v.to_ascii_lowercase();
+  lower.ends_with(".exe") || v.contains('/') || v.contains('\\')
+}
+
+fn should_absolutize_model_path(raw: &str) -> bool {
+  let v = raw.trim();
+  if v.is_empty() {
+    return false;
+  }
+  // Ollama 模型名（如 qwen2.5:3b）不应当被绝对路径化。
+  // 仅对明显的本地模型文件路径（.gguf）做绝对路径展开。
+  v.to_ascii_lowercase().ends_with(".gguf")
+}
+
 fn read_json_or_default<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, AppError> {
   if !path.exists() {
     return Ok(T::default());
@@ -148,8 +172,12 @@ pub fn load_settings() -> Result<AppSettings, AppError> {
   }
   let mut settings: AppSettings = read_json_or_default(&path)?;
   if let Some(base_dir) = path.parent() {
-    settings.llama_cli_path = absolutize_config_path(&settings.llama_cli_path, base_dir);
-    settings.model_path = absolutize_config_path(&settings.model_path, base_dir);
+    if should_absolutize_llama_cli_path(&settings.llama_cli_path) {
+      settings.llama_cli_path = absolutize_config_path(&settings.llama_cli_path, base_dir);
+    }
+    if should_absolutize_model_path(&settings.model_path) {
+      settings.model_path = absolutize_config_path(&settings.model_path, base_dir);
+    }
   }
   Ok(settings)
 }

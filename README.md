@@ -12,7 +12,7 @@
 - 桌面框架：Tauri 1.x
 - 后端：Rust 2021
 - 前端：原生 HTML + CSS + JavaScript
-- 模型调用：llama.cpp 的 `llama-cli` + 本地 GGUF 模型
+- 模型调用：Ollama 本地服务（`http://127.0.0.1:11434`）
 
 关键依赖（后端）：
 - `pdf-extract`：PDF 文本抽取
@@ -55,9 +55,8 @@
 后端命令：`parse_resume(text, settings)`
 
 解析策略：
-- 将简历文本分段（基础信息、工作经历、项目经历）
-- 分别构造 Prompt 调用 `llama-cli`
-- 提取 JSON 并合并为统一结构
+- 使用统一 Prompt 调用 Ollama `/api/generate`
+- 提取 JSON 并转换为统一结构
 - 最后进行字段归一化（空值、索引重排、去空白）
 
 设置项：
@@ -72,7 +71,7 @@
 
 导出格式：
 - JavaScript 文件，默认文件名示例 `resume_data.js`
-- 内容结构与项目内模板 `解析结果模板.js` 一致方向
+- 内容结构与项目内模板 `解析结果模板.json` 一致方向
 
 ## 4. 简历库管理
 
@@ -100,8 +99,8 @@
 - `app-config.json`
 
 字段说明：
-- `llamaCliPath`：`llama-cli` 可执行文件路径（支持相对路径）
-- `modelPath`：GGUF 模型路径（支持相对路径）
+- `llamaCliPath`：Ollama 服务地址（默认 `http://127.0.0.1:11434`）
+- `modelPath`：Ollama 模型名（例如 `qwen2.5:3b`）
 - `threads`：推理线程数
 - `temperature`：采样温度
 

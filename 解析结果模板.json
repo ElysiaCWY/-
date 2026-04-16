@@ -1,0 +1,48 @@
+{
+  "_comment": "简历结构化输出模板。请保持字段名不变。",
+  "basicInfo": {
+    "_comment": "基础信息",
+    "name": "",
+    "age": "",
+    "gender": "",
+    "education": [
+      {
+        "_comment": "教育经历项",
+        "school": "",
+        "major": "",
+        "degree": "",
+        "period": ""
+      }
+    ],
+    "skills": [],
+    "certificates": []
+  },
+  "workExperience": {
+    "_comment": "工作经历。按时间倒序，1 为最新一段。",
+    "1": {
+      "company": "",
+      "position": "",
+      "period": "",
+      "description": ""
+    },
+    "2": {
+      "company": "",
+      "position": "",
+      "period": "",
+      "description": ""
+    }
+  },
+  "projectExperience": {
+    "_comment": "项目经历。按时间倒序或重要性排序，1 为优先项。",
+    "1": {
+      "projectName": "",
+      "projectDescription": "",
+      "projectAchievements": ""
+    },
+    "2": {
+      "projectName": "",
+      "projectDescription": "",
+      "projectAchievements": ""
+    }
+  }
+}
