@@ -21,6 +21,7 @@ time = { version = "0.3", features = ["formatting"] }
 dirs = "5.0"
 ureq = { version = "2.10", features = ["json"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+printpdf = "0.9.1"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -53,6 +53,9 @@ const resumeDetailBasic = $("resumeDetailBasic");
 const resumeDetailWorkBody = $("resumeDetailWorkBody");
 const resumeDetailProjectBody = $("resumeDetailProjectBody");
 const resumeDetailBack = $("resumeDetailBack");
+const jdCompareBack = $("jdCompareBack");
+const jdCompareReportContent = $("jdCompareReportContent");
+const tplCandidateList = $("tplCandidateList");
 
 let importedPath = null;
 let selectedQueueIndex = -1;
@@ -60,6 +63,11 @@ let importQueue = [];
 let lastResumeObj = null;
 let libraryRecords = [];
 let jdRecords = [];
+/** 最近一次「JD 筛选 / 计算匹配分」返回的候选人数，用于首页「匹配中简历」卡片 */
+let lastJdMatchCount = 0;
+let lastJdRankingRows = [];
+let resumeDetailBackTarget = "library";
+let selectedTemplateKeys = new Set();
 let filteredLibraryRecords = [];
 let importInProgress = false;
 let appSettings = {
@@ -74,6 +82,7 @@ const TITLE_MAP = {
   library: "简历库",
   parse: "简历导入 & 解析",
   jd: "JD 管理 & 筛选",
+  jdCompareReport: "候选人对比报告",
   resumeDetail: "简历详情",
 };
 
@@ -118,7 +127,8 @@ function bindQuickActions() {
   $("gotoParse")?.addEventListener("click", () => jumpToStandalonePage("parse"));
   $("gotoJd")?.addEventListener("click", () => jumpToStandalonePage("jd"));
   $("gotoTemplate")?.addEventListener("click", () => jumpToStandalonePage("jd"));
-  resumeDetailBack?.addEventListener("click", () => jumpToStandalonePage("library"));
+  resumeDetailBack?.addEventListener("click", () => jumpToStandalonePage(resumeDetailBackTarget || "library"));
+  jdCompareBack?.addEventListener("click", () => jumpToStandalonePage("jd"));
 
   $("btnNewJd")?.addEventListener("click", async () => {
     const title = window.prompt("请输入 JD 标题：");
@@ -149,11 +159,29 @@ function bindQuickActions() {
 
   $("tplRegenerate")?.addEventListener("click", updateTemplatePreview);
   $("tplExportWord")?.addEventListener("click", () => alert("桌面版原型：Word 导出将于下一阶段接入。"));
-  $("tplExportPdf")?.addEventListener("click", () => alert("桌面版原型：PDF 导出将于下一阶段接入。"));
+  $("tplExportPdf")?.addEventListener("click", async () => {
+    try {
+      const content = (templatePreview?.textContent || "").trim();
+      if (!content || content.includes("请先在上方“候选人选择”勾选")) {
+        alert("请先选择候选人并生成预览内容。");
+        return;
+      }
+      const outPath = await saveDialog({
+        defaultPath: "standard_resumes.pdf",
+        filters: [{ name: "PDF", extensions: ["pdf"] }],
+      });
+      if (!outPath) return;
+      await invoke("export_resume_pdf", { content, outPath });
+      alert(`PDF 导出成功：${outPath}`);
+    } catch (e) {
+      alert(String(e));
+    }
+  });
 
-  $("jdExportBtn")?.addEventListener("click", () => alert("桌面版原型：名单导出将于下一阶段接入。"));
-  $("jdViewResumeBtn")?.addEventListener("click", () => jumpToStandalonePage("library"));
-  $("jdCompareBtn")?.addEventListener("click", () => alert("桌面版原型：对比报告将于下一阶段接入。"));
+  $("jdCompareBtn")?.addEventListener("click", () => {
+    renderJdCompareReport(lastJdRankingRows);
+    jumpToStandalonePage("jdCompareReport");
+  });
 }
 
 function clickNav(page) {
@@ -233,6 +261,7 @@ function renderLibraryTable(records) {
       const id = btn.dataset.id;
       const rec = libraryRecords.find((x) => x.id === id);
       if (!rec) return;
+      resumeDetailBackTarget = "library";
       renderResumeDetailPage(rec);
       jumpToStandalonePage("resumeDetail");
     });
@@ -453,11 +482,34 @@ function renderJdList(records) {
     .join("");
 }
 
+function countImportedToday(records) {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const startSec = Math.floor(start.getTime() / 1000);
+  const endSec = startSec + 86400;
+  let n = 0;
+  for (const r of records) {
+    const t = parseInt(r.createdAt, 10);
+    if (Number.isFinite(t) && t >= startSec && t < endSec) n += 1;
+  }
+  return n;
+}
+
+/** 与「开始解析」按钮一致：已抽取文本且尚未标记为已完成的队列项 */
+function pendingParseQueueCount() {
+  return importQueue.filter((x) => !x.error && x.text && x.status !== "已完成").length;
+}
+
 function updateStats() {
-  $("statTotal").textContent = String(libraryRecords.length);
-  $("statToday").textContent = "0";
-  $("statPending").textContent = parseQueue.textContent?.includes("待解析") ? "1" : "0";
-  $("statMatching").textContent = jdRecords.length > 0 ? String(Math.min(libraryRecords.length, 9)) : "0";
+  const elTotal = $("statTotal");
+  const elToday = $("statToday");
+  const elPending = $("statPending");
+  const elMatching = $("statMatching");
+  if (!elTotal || !elToday || !elPending || !elMatching) return;
+  elTotal.textContent = String(libraryRecords.length);
+  elToday.textContent = String(countImportedToday(libraryRecords));
+  elPending.textContent = String(pendingParseQueueCount());
+  elMatching.textContent = String(lastJdMatchCount);
 }
 
 async function refreshLibraryAndStats() {
@@ -479,6 +531,7 @@ function renderQueueTable() {
   if (!importQueue.length) {
     parseQueue.innerHTML = '<tr><td colspan="3" class="muted">暂无任务</td></tr>';
     if (parseProgressText) parseProgressText.textContent = "0/0 (0%)";
+    updateStats();
     return;
   }
 
@@ -512,6 +565,7 @@ function renderQueueTable() {
       </tr>`;
     })
     .join("");
+  updateStats();
 }
 
 function clearProgressTimer(item) {
@@ -581,48 +635,261 @@ function renderStructuredCards(resume) {
 }
 
 function updateTemplatePreview() {
-  const src = lastResumeObj || libraryRecords[0]?.data;
-  if (!src) {
-    templatePreview.textContent = "请先在“简历导入 & 解析”完成解析，再来此页面生成预览。";
+  const cleanInline = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+  const selectedRows = getCurrentTemplateRows().filter((row) => selectedTemplateKeys.has(rowKeyForTemplate(row)));
+  const selected = selectedRows
+    .map((row) => resolveResumeRecordFromJdRow(row))
+    .filter(Boolean)
+    .map((rec) => rec.data);
+  if (!selected.length) {
+    templatePreview.textContent = "请先在上方“候选人选择”勾选要生成的简历。";
     return;
   }
-  const b = src.basicInfo || {};
-  const work = src.workExperience?.["1"] || {};
-  const proj = src.projectExperience?.["1"] || {};
-  const lines = [];
-  lines.push(`# ${b.name || "候选人姓名"}`);
-  lines.push(`- 性别：${b.gender || "-"}  年龄：${b.age || "-"}`);
-  lines.push(`- 核心技能：${(b.skills || []).join(" / ") || "-"}`);
-  if ($("tplEdu")?.checked) {
-    const e = b.education?.[0] || {};
-    lines.push(`- 教育：${e.school || "-"} ${e.degree || ""} ${e.major || ""}`.trim());
+  const blocks = selected.map((src) => {
+    const b = src.basicInfo || {};
+    const workRows = Object.keys(src.workExperience || {})
+      .sort((a, b) => Number(a) - Number(b))
+      .map((k) => src.workExperience?.[k] || {})
+      .filter((x) => x.company || x.position || x.period || x.description);
+    const projectRows = Object.keys(src.projectExperience || {})
+      .sort((a, b) => Number(a) - Number(b))
+      .map((k) => src.projectExperience?.[k] || {})
+      .filter((x) => x.projectName || x.projectDescription || x.projectAchievements);
+    const lines = [];
+    lines.push(`# ${cleanInline(b.name) || "候选人姓名"}`);
+    lines.push("## 基础信息");
+    lines.push(`- 性别：${cleanInline(b.gender) || "-"}`);
+    lines.push(`- 年龄：${cleanInline(b.age) || "-"}`);
+    lines.push(`- 联系方式：${cleanInline(b.contact) || "-"}`);
+
+    const eduRows = Array.isArray(b.education) ? b.education.filter((e) => e?.school || e?.degree || e?.major || e?.period || e?.graduationDate) : [];
+    if (eduRows.length) {
+      lines.push("## 教育背景");
+      eduRows.forEach((e) => {
+        const period = cleanInline(e.period || e.graduationDate || "-");
+        lines.push(`- ${cleanInline(e.school) || "-"} / ${cleanInline(e.degree) || "-"} / ${cleanInline(e.major) || "-"} / ${period}`);
+      });
+    }
+
+    if ($("tplSkill")?.checked && Array.isArray(b.skills) && b.skills.length) {
+      lines.push("## 技能");
+      lines.push(`- ${(b.skills || []).map((s) => cleanInline(s)).filter(Boolean).join(" / ")}`);
+    }
+
+    if (workRows.length) {
+      lines.push("## 工作经历");
+      workRows.forEach((w) => {
+        lines.push(`- ${cleanInline(w.company) || "-"} / ${cleanInline(w.position) || "-"} / ${cleanInline(w.period) || "-"}`);
+        if (w.description) lines.push(`  - ${cleanInline(w.description)}`);
+      });
+    }
+
+    if (projectRows.length) {
+      lines.push("## 项目经历");
+      projectRows.forEach((p) => {
+        lines.push(`- ${cleanInline(p.projectName) || "-"}：${cleanInline(p.projectDescription) || "-"}`);
+        if (p.projectAchievements) lines.push(`  - 成果：${cleanInline(p.projectAchievements)}`);
+      });
+    }
+    return lines.join("\n");
+  });
+  const missingCount = Math.max(0, selectedRows.length - selected.length);
+  const warning = missingCount > 0
+    ? `提示：有 ${missingCount} 份候选人未匹配到完整简历数据，已自动跳过。\n\n`
+    : "";
+  templatePreview.textContent = `${warning}${blocks.join("\n\n------------------------------\n\n")}`;
+}
+
+function rowKeyForTemplate(row) {
+  return String(row.resumeId || row.parsedId || row.sourceFile || row.candidateName || "").trim();
+}
+
+function getCurrentTemplateRows() {
+  const selectedTopN = Math.max(1, Number(jdTopN?.value || 10));
+  return (lastJdRankingRows || []).slice(0, selectedTopN);
+}
+
+function getSelectedTemplateRecords() {
+  const rows = getCurrentTemplateRows();
+  return rows
+    .filter((row) => selectedTemplateKeys.has(rowKeyForTemplate(row)))
+    .map((row) => resolveResumeRecordFromJdRow(row))
+    .filter(Boolean)
+    .map((rec) => rec.data);
+}
+
+function renderTemplateCandidatePicker(rows) {
+  if (!tplCandidateList) return;
+  if (!rows.length) {
+    tplCandidateList.innerHTML = '<span class="muted">请先在上方执行“计算匹配分”，此处将同步展示筛选名单。</span>';
+    selectedTemplateKeys = new Set();
+    updateTemplatePreview();
+    return;
   }
-  lines.push(`- 最近工作：${work.company || "-"} / ${work.position || "-"} / ${work.period || "-"}`);
-  if ($("tplProject")?.checked) {
-    lines.push(`- 代表项目：${proj.projectName || "-"}：${proj.projectAchievements || proj.projectDescription || "-"}`);
+
+  const nextSelected = new Set();
+  rows.forEach((row) => {
+    const key = rowKeyForTemplate(row);
+    if (!key) return;
+    if (selectedTemplateKeys.has(key) || selectedTemplateKeys.size === 0) {
+      nextSelected.add(key);
+    }
+  });
+  selectedTemplateKeys = nextSelected;
+
+  tplCandidateList.innerHTML = rows
+    .map((row) => {
+      const key = rowKeyForTemplate(row);
+      const checked = selectedTemplateKeys.has(key) ? "checked" : "";
+      const label = `${row.candidateName || "-"}（匹配分：${row.score ?? 0}）`;
+      return `<label style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:6px 0;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#fff;">
+        <span>${escapeHtml(label)}</span>
+        <input type="checkbox" class="tpl-candidate-checkbox" data-key="${escapeHtml(key)}" ${checked} />
+      </label>`;
+    })
+    .join("");
+
+  $$(".tpl-candidate-checkbox").forEach((el) => {
+    el.addEventListener("change", () => {
+      const key = String(el.dataset.key || "").trim();
+      if (!key) return;
+      if (el.checked) selectedTemplateKeys.add(key);
+      else selectedTemplateKeys.delete(key);
+      updateTemplatePreview();
+    });
+  });
+  updateTemplatePreview();
+}
+
+function resolveResumeRecordFromJdRow(row) {
+  if (!row) return null;
+  const resumeId = String(row.resumeId || "").trim();
+  if (resumeId) {
+    const byId = libraryRecords.find((r) => String(r.id || "").trim() === resumeId);
+    if (byId) return byId;
   }
-  if ($("tplCert")?.checked) {
-    lines.push(`- 证书：${(b.certificates || []).join("、") || "-"}`);
+
+  const candidateName = String(row.candidateName || "").trim().toLowerCase();
+  const sourceFile = String(row.sourceFile || "").trim().toLowerCase();
+  const sourceBase = sourceFile.split(/[\\/]/).pop() || "";
+  const age = String(row.age || "").trim();
+  const contact = String(row.contact || "").replace(/\D+/g, "");
+
+  const exact = libraryRecords.find((r) => {
+    const b = r.data?.basicInfo || {};
+    const nameMatched = candidateName && String(b.name || "").trim().toLowerCase() === candidateName;
+    const sourceMatched = sourceFile && String(r.sourceFile || "").trim().toLowerCase() === sourceFile;
+    const sourceBaseMatched = sourceBase && (String(r.sourceFile || "").trim().toLowerCase().split(/[\\/]/).pop() || "") === sourceBase;
+    const ageMatched = age && String(b.age || "").trim() === age;
+    const contactMatched = contact && String(b.contact || "").replace(/\D+/g, "").endsWith(contact);
+    return (nameMatched && sourceMatched)
+      || (nameMatched && sourceBaseMatched)
+      || (nameMatched && ageMatched && contactMatched);
+  });
+  if (exact) return exact;
+
+  if (candidateName) {
+    const sameName = libraryRecords.filter((r) => String(r.data?.basicInfo?.name || "").trim().toLowerCase() === candidateName);
+    if (sameName.length === 1) return sameName[0];
   }
-  if ($("tplSelf")?.checked) {
-    lines.push("- 自我评价：做事认真，具备良好的沟通与执行能力。");
-  }
-  templatePreview.textContent = lines.join("\n");
+  return null;
 }
 
 function renderJdRanking(rows) {
   if (!rows.length) {
-    jdResultTable.innerHTML = '<tr><td colspan="3" class="muted">未发现可用于筛选的本地解析结果</td></tr>';
+    jdResultTable.innerHTML = '<tr><td colspan="4" class="muted">未发现可用于筛选的本地解析结果</td></tr>';
     return;
   }
+  const selectedTopN = Math.max(1, Number(jdTopN?.value || 10));
   jdResultTable.innerHTML = rows
-    .slice(0, 10)
-    .map((x) => {
+    .slice(0, selectedTopN)
+    .map((x, idx) => {
       const b = x.scoreBreakdown || {};
       const breakdown = `技${b.skillScore ?? 0}/年${b.yearsScore ?? 0}/学${b.degreeScore ?? 0}/工${b.workScore ?? 0}/项${b.projectScore ?? 0}`;
-      return `<tr><td>${x.candidateName || "-"}</td><td>${(x.matchedKeywords || []).join(", ") || "-"}</td><td>${x.score}<br/><span class="small muted">${breakdown}</span></td></tr>`;
+      return `<tr>
+        <td>${x.candidateName || "-"}</td>
+        <td>${(x.matchedKeywords || []).join(", ") || "-"}</td>
+        <td>${x.score}<br/><span class="small muted">${breakdown}</span></td>
+        <td><button type="button" class="jd-detail-btn" data-idx="${idx}">查看详情</button></td>
+      </tr>`;
     })
     .join("");
+
+  $$(".jd-detail-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.idx);
+      if (!Number.isFinite(idx)) return;
+      const row = rows[idx];
+      const rec = resolveResumeRecordFromJdRow(row);
+      if (!rec) {
+        alert("未找到对应的简历详情，可能已被删除。请先到简历库确认数据。");
+        return;
+      }
+      resumeDetailBackTarget = "jd";
+      renderResumeDetailPage(rec);
+      jumpToStandalonePage("resumeDetail");
+    });
+  });
+}
+
+function renderJdCompareReport(rows) {
+  if (!jdCompareReportContent) return;
+  if (!rows || !rows.length) {
+    jdCompareReportContent.innerHTML = '<p class="muted">暂无可对比数据，请先在 JD 页面计算匹配分。</p>';
+    return;
+  }
+
+  const selectedTopN = Math.max(1, Number(jdTopN?.value || 10));
+  const reportRows = rows.slice(0, selectedTopN).map((row) => {
+    const b = row.scoreBreakdown || {};
+    const rec = resolveResumeRecordFromJdRow(row);
+    const workYears = rec ? calcWorkYears(rec.data?.workExperience || {}) : (row.workYears || "-");
+    const degree = rec?.data?.basicInfo?.education?.[0]?.degree || row.degree || "-";
+    return {
+      name: row.candidateName || "-",
+      score: row.score ?? 0,
+      matchedKeywords: (row.matchedKeywords || []).join("、") || "-",
+      skillScore: b.skillScore ?? 0,
+      yearsScore: b.yearsScore ?? 0,
+      degreeScore: b.degreeScore ?? 0,
+      workScore: b.workScore ?? 0,
+      projectScore: b.projectScore ?? 0,
+      degree,
+      workYears,
+    };
+  });
+
+  const avgScore = Math.round(reportRows.reduce((sum, x) => sum + Number(x.score || 0), 0) / reportRows.length);
+  const top = reportRows[0];
+  const weak = reportRows[reportRows.length - 1];
+  jdCompareReportContent.innerHTML = `
+    <div class="mini-card">
+      <h3>报告摘要</h3>
+      <p class="small muted">候选人数：${reportRows.length}，平均匹配分：${avgScore}，最高分：${top.name}（${top.score}），最低分：${weak.name}（${weak.score}）。</p>
+    </div>
+    <table class="table">
+      <thead>
+        <tr>
+          <th>姓名</th>
+          <th>总分</th>
+          <th>学历</th>
+          <th>工作年限</th>
+          <th>分项（技/年/学/工/项）</th>
+          <th>匹配关键词</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${reportRows.map((x) => `<tr>
+          <td>${escapeHtml(x.name)}</td>
+          <td>${escapeHtml(String(x.score))}</td>
+          <td>${escapeHtml(x.degree)}</td>
+          <td>${escapeHtml(x.workYears)}</td>
+          <td>${escapeHtml(`${x.skillScore}/${x.yearsScore}/${x.degreeScore}/${x.workScore}/${x.projectScore}`)}</td>
+          <td>${escapeHtml(x.matchedKeywords)}</td>
+        </tr>`).join("")}
+      </tbody>
+    </table>
+  `;
 }
 
 async function handleImportClick() {
@@ -847,15 +1114,23 @@ btnScore.addEventListener("click", async () => {
     const rows = await invoke("jd_filter_by_keywords", { position, jdText: jd, limit });
 
     if (!rows.length) {
+      lastJdMatchCount = 0;
+      lastJdRankingRows = [];
+      renderTemplateCandidatePicker([]);
       scoreOut.textContent = "score=- (matched=0/0)";
       renderJdRanking([]);
+      updateStats();
       return;
     }
 
     const top = rows[0];
     const b = top.scoreBreakdown || {};
+    lastJdMatchCount = rows.length;
+    lastJdRankingRows = rows.slice();
+    renderTemplateCandidatePicker(getCurrentTemplateRows());
     scoreOut.textContent = `top=${top.score} | 技${b.skillScore ?? 0} 年${b.yearsScore ?? 0} 学${b.degreeScore ?? 0} 工${b.workScore ?? 0} 项${b.projectScore ?? 0}`;
     renderJdRanking(rows);
+    updateStats();
   } catch (e) {
     alert(String(e));
   } finally {
@@ -869,6 +1144,10 @@ btnClear.addEventListener("click", () => {
   selectedQueueIndex = -1;
   importQueue = [];
   lastResumeObj = null;
+  lastJdMatchCount = 0;
+  lastJdRankingRows = [];
+  selectedTemplateKeys = new Set();
+  renderTemplateCandidatePicker([]);
   currentFile.textContent = "未选择";
   renderQueueTable();
   jdInput.value = "";
@@ -883,7 +1162,12 @@ loadSettingsFromFile();
 applyHashRoute();
 window.addEventListener("hashchange", applyHashRoute);
 
-["tplEdu", "tplProject", "tplCert", "tplSelf", "tplName", "tplLength"].forEach((id) => {
+["tplSkill"].forEach((id) => {
   $(id)?.addEventListener("change", updateTemplatePreview);
+});
+
+jdTopN?.addEventListener("change", () => {
+  renderJdRanking(lastJdRankingRows);
+  renderTemplateCandidatePicker(getCurrentTemplateRows());
 });
 

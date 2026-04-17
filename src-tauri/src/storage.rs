@@ -3,8 +3,10 @@ use crate::jd::{JdStructuredRequirement, ResumeStructuredForScore};
 use crate::schema::{AppSettings, JdRecord, ParsedJdScoreRecord, ParsedResultRecord, ResumeData, ResumeRecord};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
@@ -219,8 +221,15 @@ fn now_epoch() -> i64 {
     .unwrap_or(0)
 }
 
+static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn make_id(prefix: &str) -> String {
-  format!("{prefix}-{}", now_epoch())
+  let millis = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|d| d.as_millis())
+    .unwrap_or(0);
+  let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+  format!("{prefix}-{millis}-{seq}")
 }
 
 fn today_ymd() -> String {
@@ -246,6 +255,15 @@ fn identity_key(name: &str, age: &str, contact: &str) -> Option<String> {
     return None;
   }
   Some(format!("{}|{}|{}", n, a, c))
+}
+
+fn fallback_identity_key(name: &str, source_file: &str) -> Option<String> {
+  let n = name.trim().to_ascii_lowercase();
+  let sf = source_file.trim().to_ascii_lowercase();
+  if n.is_empty() && sf.is_empty() {
+    return None;
+  }
+  Some(format!("{}|{}", n, sf))
 }
 
 fn sanitize_filename(input: &str) -> String {
@@ -479,10 +497,18 @@ pub fn list_resumes() -> Result<Vec<ResumeRecord>, AppError> {
 pub fn save_resume(source_file: String, data: ResumeData) -> Result<ResumeRecord, AppError> {
   let path = resumes_path()?;
   let mut items: Vec<ResumeRecord> = read_json_or_default(&path)?;
+  let source_file_trimmed = source_file.trim().to_string();
+  let name_trimmed = data.basic_info.name.trim().to_string();
   let new_key = identity_key(&data.basic_info.name, &data.basic_info.age, &data.basic_info.contact);
   if let Some(key) = new_key {
     items.retain(|x| {
       identity_key(&x.data.basic_info.name, &x.data.basic_info.age, &x.data.basic_info.contact)
+        .map(|k| k != key)
+        .unwrap_or(true)
+    });
+  } else if let Some(key) = fallback_identity_key(&name_trimmed, &source_file_trimmed) {
+    items.retain(|x| {
+      fallback_identity_key(&x.data.basic_info.name, &x.source_file)
         .map(|k| k != key)
         .unwrap_or(true)
     });
@@ -843,17 +869,25 @@ pub fn save_parsed_result_json(source_file: String, resume_id: String, data: Res
 
   let mut items: Vec<ParsedResultRecord> = read_json_or_default(&index_path)?;
   let new_identity = identity_key(&candidate_name, &age, &contact);
+  let fallback_identity = fallback_identity_key(&candidate_name, &source_file);
+  let has_resume_id = !resume_id.trim().is_empty();
   let mut removed: Vec<ParsedResultRecord> = Vec::new();
-  if let Some(key) = new_identity {
-    items.retain(|x| {
-      let matched = parsed_record_identity_key(x).map(|k| k == key).unwrap_or(false);
-      if matched {
-        removed.push(x.clone());
-        return false;
-      }
-      true
-    });
-  }
+  items.retain(|x| {
+    let matched_resume_id = has_resume_id && x.resume_id.as_deref() == Some(resume_id.as_str());
+    let matched_identity = new_identity
+      .as_ref()
+      .map(|key| parsed_record_identity_key(x).map(|k| &k == key).unwrap_or(false))
+      .unwrap_or(false);
+    let matched_fallback = fallback_identity
+      .as_ref()
+      .map(|key| fallback_identity_key(&x.candidate_name, &x.source_file).map(|k| &k == key).unwrap_or(false))
+      .unwrap_or(false);
+    if matched_resume_id || matched_identity || matched_fallback {
+      removed.push(x.clone());
+      return false;
+    }
+    true
+  });
   for old in &removed {
     if !old.json_path.trim().is_empty() {
       let _ = fs::remove_file(&old.json_path);
@@ -1034,9 +1068,15 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
   let top_n = clamp_limit(limit);
   let settings = load_settings()?;
   let req = ai_extract_jd_requirements(&position, &jd_text, &settings)?;
+  let valid_resume_ids: HashSet<String> = list_resumes()?
+    .into_iter()
+    .map(|x| x.id.trim().to_string())
+    .filter(|x| !x.is_empty())
+    .collect();
   let conn = open_resumes_db()?;
 
   let mut out: Vec<ParsedJdScoreRecord> = Vec::new();
+  let mut seen: HashSet<String> = HashSet::new();
   let mut stmt = conn
     .prepare(
       "SELECT
@@ -1104,6 +1144,23 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
       project_text,
     };
     let score = crate::jd::score_structured_resume(&req, &resume_struct);
+    if let Some(id) = resume_id.as_deref() {
+      let rid = id.trim();
+      if !rid.is_empty() && !valid_resume_ids.contains(rid) {
+        continue;
+      }
+    }
+    let dedupe_key = resume_id
+      .as_deref()
+      .map(|x| x.trim().to_string())
+      .filter(|x| !x.is_empty())
+      .or_else(|| identity_key(&candidate_name, &age, &contact))
+      .or_else(|| fallback_identity_key(&candidate_name, &source_file))
+      .unwrap_or_else(|| parsed_id.clone());
+    if seen.contains(&dedupe_key) {
+      continue;
+    }
+    seen.insert(dedupe_key);
 
     out.push(ParsedJdScoreRecord {
       parsed_id,
@@ -1191,6 +1248,7 @@ pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: 
   let top_n = clamp_limit(limit);
 
   let mut out: Vec<ParsedJdScoreRecord> = Vec::new();
+  let mut seen: HashSet<String> = HashSet::new();
   for item in items {
     if !parsed_item_matches_position(&item, &position) {
       continue;
@@ -1213,6 +1271,18 @@ pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: 
       Ok(v) => v,
       Err(_) => continue,
     };
+    let dedupe_key = item
+      .resume_id
+      .as_deref()
+      .map(|x| x.trim().to_string())
+      .filter(|x| !x.is_empty())
+      .or_else(|| identity_key(&item.candidate_name, &item.age, &item.contact))
+      .or_else(|| fallback_identity_key(&item.candidate_name, &item.source_file))
+      .unwrap_or_else(|| item.id.clone());
+    if seen.contains(&dedupe_key) {
+      continue;
+    }
+    seen.insert(dedupe_key);
 
     out.push(ParsedJdScoreRecord {
       parsed_id: item.id,

@@ -181,27 +181,24 @@
             <div class="mini-card">
               <h3>匹配结果（按匹配度排序）</h3>
               <table class="table">
-                <thead><tr><th>姓名</th><th>匹配关键词</th><th>匹配分</th></tr></thead>
+                <thead><tr><th>姓名</th><th>匹配关键词</th><th>匹配分</th><th>操作</th></tr></thead>
                 <tbody id="jdResultTable">
-                  <tr><td colspan="3" class="muted">暂无匹配结果</td></tr>
+                  <tr><td colspan="4" class="muted">暂无匹配结果</td></tr>
                 </tbody>
               </table>
             </div>
             <div class="row">
-              <button id="jdExportBtn">导出名单</button><button id="jdViewResumeBtn">查看简历</button><button id="jdCompareBtn">生成对比报告</button>
+              <button id="jdCompareBtn">生成对比报告</button>
             </div>
           </section>
           <section class="card">
             <h2>标准简历模板生成</h2>
-            <div class="row">
-              <select id="tplName"><option>简约版</option><option>详细版</option><option>企业版</option></select>
-              <select id="tplLength"><option>精简</option><option selected>标准</option><option>详细</option></select>
+            <div id="tplCandidatePicker" class="mini-card">
+              <h3>候选人选择（可多选）</h3>
+              <div id="tplCandidateList" class="muted">请先在上方执行“计算匹配分”，此处将同步展示筛选名单。</div>
             </div>
             <div class="row">
-              <label><input id="tplEdu" type="checkbox" checked /> 教育经历</label>
-              <label><input id="tplProject" type="checkbox" checked /> 项目经历</label>
-              <label><input id="tplCert" type="checkbox" /> 证书</label>
-              <label><input id="tplSelf" type="checkbox" /> 自我评价</label>
+              <label><input id="tplSkill" type="checkbox" checked /> 技能</label>
             </div>
             <div class="mini-card">
               <h3>模板预览</h3>
@@ -210,6 +207,19 @@
             <div class="row">
               <button id="tplExportWord">导出 Word</button><button id="tplExportPdf">导出 PDF</button><button id="tplRegenerate">重新生成</button>
             </div>
+          </section>
+        </section>
+
+        <section class="page" data-page="jdCompareReport">
+          <section class="card">
+            <div class="row" style="justify-content: space-between; align-items: center;">
+              <h2 style="margin: 0;">候选人对比报告</h2>
+              <button id="jdCompareBack" class="ghost">返回 JD 筛选</button>
+            </div>
+            <p class="subtext">基于当前 JD 匹配结果生成，便于快速横向比较候选人。</p>
+          </section>
+          <section class="card">
+            <div id="jdCompareReportContent" class="muted">请先在 JD 页面执行“计算匹配分”，再生成对比报告。</div>
           </section>
         </section>
 

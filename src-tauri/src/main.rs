@@ -1,4 +1,5 @@
 mod errors;
+mod export_pdf;
 mod export_js;
 mod extract;
 mod jd;
@@ -29,6 +30,11 @@ async fn parse_resume(text: String, settings: LlmSettings) -> Result<ResumeData,
 #[tauri::command]
 fn export_js(resume_obj: ResumeData, out_path: String) -> Result<(), AppError> {
   export_js::write_resume_js(&resume_obj, &out_path)
+}
+
+#[tauri::command]
+fn export_resume_pdf(content: String, out_path: String) -> Result<(), AppError> {
+  export_pdf::write_resume_pdf(&content, &out_path)
 }
 
 #[tauri::command]
@@ -92,6 +98,7 @@ fn main() {
       extract_text,
       parse_resume,
       export_js,
+      export_resume_pdf,
       jd_score_v1,
       jd_score_from_local_parsed,
       jd_filter_by_keywords,
