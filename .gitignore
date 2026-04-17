@@ -15,6 +15,10 @@ llama-b8797-bin-win-cpu-x64/
 app-config.json
 *.log
 
+# Project-local DB and parsed resume outputs (do not commit)
+data/
+parsed-results/
+
 # OS/editor
 .DS_Store
 Thumbs.db

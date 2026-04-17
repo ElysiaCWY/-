@@ -33,6 +33,8 @@ const currentFile = $("currentFile");
 const parseProgressText = $("parseProgressText");
 
 const jdInput = $("jdInput");
+const jdPositionInput = $("jdPositionInput");
+const jdTopN = $("jdTopN");
 const scoreOut = $("scoreOut");
 const parseQueue = $("parseQueue");
 const pageTitle = $("pageTitle");
@@ -72,7 +74,6 @@ const TITLE_MAP = {
   library: "简历库",
   parse: "简历导入 & 解析",
   jd: "JD 管理 & 筛选",
-  template: "模板管理",
   resumeDetail: "简历详情",
 };
 
@@ -116,7 +117,7 @@ function bindQuickActions() {
   $("quickExport")?.addEventListener("click", () => jumpToStandalonePage("jd"));
   $("gotoParse")?.addEventListener("click", () => jumpToStandalonePage("parse"));
   $("gotoJd")?.addEventListener("click", () => jumpToStandalonePage("jd"));
-  $("gotoTemplate")?.addEventListener("click", () => jumpToStandalonePage("template"));
+  $("gotoTemplate")?.addEventListener("click", () => jumpToStandalonePage("jd"));
   resumeDetailBack?.addEventListener("click", () => jumpToStandalonePage("library"));
 
   $("btnNewJd")?.addEventListener("click", async () => {
@@ -221,8 +222,8 @@ function renderLibraryTable(records) {
         <td>${latestWork.position || "-"}</td>
         <td>${workYears}</td>
         <td>${importedDate}</td>
-        <td><button class="library-detail-btn" data-id="${r.id}">查看详情</button></td>
-        <td><button class="ghost library-delete-btn" data-id="${r.id}">删除</button></td>
+          <td><button type="button" class="library-detail-btn" data-id="${r.id}">查看详情</button></td>
+          <td><button type="button" class="ghost library-delete-btn" data-id="${r.id}">删除</button></td>
       </tr>`;
     })
     .join("");
@@ -238,11 +239,11 @@ function renderLibraryTable(records) {
   });
 
   $$(".library-delete-btn").forEach((btn) => {
-    btn.addEventListener("click", async () => {
+    btn.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       const id = btn.dataset.id;
       if (!id) return;
-      const ok = window.confirm("确认删除该简历记录吗？此操作不可恢复。");
-      if (!ok) return;
       try {
         await invoke("delete_resume_record", { id });
         await refreshLibraryAndStats();
@@ -265,12 +266,39 @@ function formatDateFromEpoch(v) {
 }
 
 function parsePeriodStart(period) {
-  const m = String(period || "").match(/(\d{4})\.(\d{1,2})/);
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mon = Number(m[2]);
-  if (!Number.isFinite(y) || !Number.isFinite(mon)) return null;
-  return { y, mon };
+  const text = String(period || "").trim();
+  if (!text) return null;
+
+  // 支持 YYYY.MM / YYYY-MM / YYYY/MM / YYYY年MM月
+  let m = text.match(/(\d{4})\s*[.\-/年]\s*(\d{1,2})/);
+  if (m) {
+    const y = Number(m[1]);
+    const mon = Number(m[2]);
+    if (Number.isFinite(y) && Number.isFinite(mon) && mon >= 1 && mon <= 12) {
+      return { y, mon };
+    }
+  }
+
+  // 支持 YYYYMM（如 201912~202006）
+  m = text.match(/(\d{4})(\d{2})/);
+  if (m) {
+    const y = Number(m[1]);
+    const mon = Number(m[2]);
+    if (Number.isFinite(y) && Number.isFinite(mon) && mon >= 1 && mon <= 12) {
+      return { y, mon };
+    }
+  }
+
+  // 仅识别到年份时，默认按 1 月处理
+  m = text.match(/(\d{4})/);
+  if (m) {
+    const y = Number(m[1]);
+    if (Number.isFinite(y)) {
+      return { y, mon: 1 };
+    }
+  }
+
+  return null;
 }
 
 function calcWorkYears(workExp) {
@@ -326,7 +354,20 @@ function renderResumeDetailPage(rec) {
 
   const workRows = Object.keys(work)
     .sort((a, b) => Number(a) - Number(b))
-    .map((k) => work[k] || {});
+    .map((k, index) => ({ ...(work[k] || {}), __idx: index }))
+    .sort((a, b) => {
+      const sa = parsePeriodStart(a.period);
+      const sb = parsePeriodStart(b.period);
+      if (sa && sb) {
+        if (sa.y !== sb.y) return sa.y - sb.y;
+        if (sa.mon !== sb.mon) return sa.mon - sb.mon;
+      } else if (sa && !sb) {
+        return -1;
+      } else if (!sa && sb) {
+        return 1;
+      }
+      return a.__idx - b.__idx;
+    });
 
   if (!workRows.length) {
     resumeDetailWorkBody.innerHTML = '<tr><td colspan="4" class="muted">暂无工作经历</td></tr>';
@@ -399,6 +440,9 @@ function renderRecent(records) {
 }
 
 function renderJdList(records) {
+  if (!jdList) {
+    return;
+  }
   if (!records.length) {
     jdList.innerHTML = "<li>暂无 JD</li>";
     return;
@@ -433,7 +477,7 @@ async function refreshJdList() {
 
 function renderQueueTable() {
   if (!importQueue.length) {
-    parseQueue.innerHTML = '<tr><td colspan="2" class="muted">暂无任务</td></tr>';
+    parseQueue.innerHTML = '<tr><td colspan="3" class="muted">暂无任务</td></tr>';
     if (parseProgressText) parseProgressText.textContent = "0/0 (0%)";
     return;
   }
@@ -448,12 +492,69 @@ function renderQueueTable() {
   parseQueue.innerHTML = importQueue
     .map((item) => {
       const status = item.status || "待解析";
+      const progress = Number.isFinite(item.progress) ? Math.max(0, Math.min(100, Math.round(item.progress))) : 0;
+      const elapsedText = formatDurationMs(item.parseElapsedMs);
+      const isError = status === "需修正";
       return `<tr>
         <td>${item.fileName}</td>
-        <td>${status}</td>
+        <td>
+          <div class="queue-progress-wrap">
+            <div class="queue-progress-meta">
+              <span>${status}</span>
+              <span>${progress}%</span>
+            </div>
+            <div class="queue-progress-track">
+              <div class="queue-progress-fill${isError ? " is-error" : ""}" style="width:${progress}%"></div>
+            </div>
+          </div>
+        </td>
+        <td>${elapsedText}</td>
       </tr>`;
     })
     .join("");
+}
+
+function clearProgressTimer(item) {
+  if (item && item.progressTimer) {
+    clearInterval(item.progressTimer);
+    item.progressTimer = null;
+  }
+}
+
+function animateProgressTo(item, target, stepMs = 24) {
+  if (!item) return;
+  const safeTarget = Math.max(0, Math.min(100, Math.round(target)));
+  const current = Number.isFinite(item.progress) ? Math.round(item.progress) : 0;
+  if (current === safeTarget) {
+    item.progress = safeTarget;
+    renderQueueTable();
+    return;
+  }
+
+  clearProgressTimer(item);
+  const direction = safeTarget > current ? 1 : -1;
+  item.progress = current;
+
+  item.progressTimer = setInterval(() => {
+    const now = Number.isFinite(item.progress) ? Math.round(item.progress) : 0;
+    const next = now + direction;
+    const reached = direction > 0 ? next >= safeTarget : next <= safeTarget;
+    item.progress = reached ? safeTarget : next;
+    renderQueueTable();
+    if (reached) {
+      clearProgressTimer(item);
+    }
+  }, stepMs);
+}
+
+function formatDurationMs(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = Math.round(ms / 100) / 10;
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = (totalSeconds % 60).toFixed(1).padStart(4, "0");
+  return `${minutes}m ${seconds}s`;
 }
 
 function renderStructuredCards(resume) {
@@ -509,23 +610,18 @@ function updateTemplatePreview() {
   templatePreview.textContent = lines.join("\n");
 }
 
-function renderJdRanking(result) {
-  if (!libraryRecords.length) {
-    jdResultTable.innerHTML = '<tr><td colspan="3" class="muted">简历库为空，请先保存简历</td></tr>';
+function renderJdRanking(rows) {
+  if (!rows.length) {
+    jdResultTable.innerHTML = '<tr><td colspan="3" class="muted">未发现可用于筛选的本地解析结果</td></tr>';
     return;
   }
-  const rows = libraryRecords
-    .map((r) => {
-      const b = r.data?.basicInfo || {};
-      const skills = (b.skills || []).map((x) => x.toLowerCase());
-      const keywords = (result.matched_keywords || []).filter((k) => skills.some((s) => s.includes(k.toLowerCase())));
-      const localScore = Math.max(0, result.score - Math.max(0, 5 - keywords.length) * 4);
-      return { name: b.name || "-", keywords, score: localScore };
-    })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 10);
   jdResultTable.innerHTML = rows
-    .map((x) => `<tr><td>${x.name}</td><td>${x.keywords.join(", ") || "-"}</td><td>${x.score}</td></tr>`)
+    .slice(0, 10)
+    .map((x) => {
+      const b = x.scoreBreakdown || {};
+      const breakdown = `技${b.skillScore ?? 0}/年${b.yearsScore ?? 0}/学${b.degreeScore ?? 0}/工${b.workScore ?? 0}/项${b.projectScore ?? 0}`;
+      return `<tr><td>${x.candidateName || "-"}</td><td>${(x.matchedKeywords || []).join(", ") || "-"}</td><td>${x.score}<br/><span class="small muted">${breakdown}</span></td></tr>`;
+    })
     .join("");
 }
 
@@ -560,11 +656,14 @@ async function handleImportClick() {
     
     currentFile.textContent = `准备导入 ${files.length} 个文件...`;
 
+    importQueue.forEach((x) => clearProgressTimer(x));
     importQueue = files.map((filePath) => ({
       filePath,
       fileName: filePath.split(/[\\/]/).pop() || filePath,
-      status: "解析中",
+      status: "抽取中",
       progress: 0,
+      progressTimer: null,
+      parseElapsedMs: null,
       text: "",
       error: "",
     }));
@@ -573,14 +672,19 @@ async function handleImportClick() {
     for (let i = 0; i < importQueue.length; i += 1) {
       const item = importQueue[i];
       try {
+        item.status = "抽取中";
+        animateProgressTo(item, 20, 28);
+        renderQueueTable();
         const extracted = await invoke("extract_text", { filePath: item.filePath });
+        clearProgressTimer(item);
         item.text = extracted || "";
         item.status = "待解析";
-        item.progress = 25;
+        animateProgressTo(item, 30, 20);
       } catch (err) {
+        clearProgressTimer(item);
         item.error = String(err);
         item.status = "需修正";
-        item.progress = 100;
+        animateProgressTo(item, 100, 10);
       }
       renderQueueTable();
     }
@@ -597,9 +701,7 @@ async function handleImportClick() {
       currentFile.textContent = "未选择";
     }
 
-    if (failCount === 0) {
-      alert(`导入完成：成功 ${successCount} 个文件`);
-    } else {
+    if (failCount !== 0) {
       const firstErr = importQueue.find((x) => x.error)?.error || "未知错误";
       alert(`导入完成：成功 ${successCount}，失败 ${failCount}\n首个失败原因：${firstErr}`);
     }
@@ -648,37 +750,56 @@ btnParse.addEventListener("click", async () => {
     for (const item of importQueue) {
       if (item.error || !item.text || item.status === "已完成") continue;
       item.status = "解析中";
-      item.progress = 60;
+      animateProgressTo(item, 60, 18);
+      const parseStartedAt = Date.now();
       renderQueueTable();
       currentFile.textContent = item.filePath;
+
+      // 解析阶段缓慢逼近 95%，避免进度条突然跳变。
+      const parseDriftTimer = setInterval(() => {
+        const p = Number.isFinite(item.progress) ? item.progress : 0;
+        if (p < 95) {
+          item.progress = Math.min(95, Math.round(p) + 1);
+          renderQueueTable();
+          return;
+        }
+        clearInterval(parseDriftTimer);
+      }, 140);
 
       try {
         const parsed = await invoke("parse_resume", { text: item.text, settings: settings() });
         lastResumeObj = parsed;
 
-        await invoke("save_resume_to_library", {
+        const savedRecord = await invoke("save_resume_to_library", {
           sourceFile: item.filePath || "manual-input",
           resumeObj: parsed,
         });
 
         await invoke("save_parsed_result_json", {
           sourceFile: item.filePath || "manual-input",
+          resumeId: savedRecord?.id || "",
           resumeObj: parsed,
         });
 
+        await refreshLibraryAndStats();
+
+        clearInterval(parseDriftTimer);
+        clearProgressTimer(item);
         item.status = "已完成";
-        item.progress = 100;
+        animateProgressTo(item, 100, 10);
+        item.parseElapsedMs = Date.now() - parseStartedAt;
         okCount += 1;
       } catch (e) {
+        clearInterval(parseDriftTimer);
+        clearProgressTimer(item);
         item.error = String(e);
         item.status = "需修正";
-        item.progress = 100;
+        animateProgressTo(item, 100, 10);
+        item.parseElapsedMs = Date.now() - parseStartedAt;
         failCount += 1;
       }
       renderQueueTable();
     }
-
-    await refreshLibraryAndStats();
     alert(`批量解析完成：成功 ${okCount}，失败 ${failCount}`);
   } catch (e) {
     alert(String(e));
@@ -711,18 +832,30 @@ btnExport?.addEventListener("click", async () => {
 btnScore.addEventListener("click", async () => {
   try {
     setBusy(true);
-    if (!lastResumeObj) {
-      alert("请先解析出结构化结果，再进行 JD 筛选。");
-      return;
-    }
+    const position = (jdPositionInput?.value || "").trim();
     const jd = jdInput.value.trim();
     if (!jd) {
       alert("请粘贴 JD 文本。");
       return;
     }
-    const result = await invoke("jd_score_v1", { resumeObj: lastResumeObj, jdText: jd });
-    scoreOut.textContent = `score=${result.score} (matched=${result.matched_keywords.length}/${result.total_keywords})`;
-    renderJdRanking(result);
+    if (!position) {
+      alert("请先输入岗位。");
+      return;
+    }
+
+    const limit = Number(jdTopN?.value || 10);
+    const rows = await invoke("jd_filter_by_keywords", { position, jdText: jd, limit });
+
+    if (!rows.length) {
+      scoreOut.textContent = "score=- (matched=0/0)";
+      renderJdRanking([]);
+      return;
+    }
+
+    const top = rows[0];
+    const b = top.scoreBreakdown || {};
+    scoreOut.textContent = `top=${top.score} | 技${b.skillScore ?? 0} 年${b.yearsScore ?? 0} 学${b.degreeScore ?? 0} 工${b.workScore ?? 0} 项${b.projectScore ?? 0}`;
+    renderJdRanking(rows);
   } catch (e) {
     alert(String(e));
   } finally {
@@ -731,6 +864,7 @@ btnScore.addEventListener("click", async () => {
 });
 
 btnClear.addEventListener("click", () => {
+  importQueue.forEach((item) => clearProgressTimer(item));
   importedPath = null;
   selectedQueueIndex = -1;
   importQueue = [];

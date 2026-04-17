@@ -14,6 +14,8 @@ pub struct ResumeData {
 pub struct BasicInfo {
   pub name: String,
   pub age: String,
+  #[serde(default)]
+  pub contact: String,
   pub gender: String,
   pub education: Vec<EducationItem>,
   pub skills: Vec<String>,
@@ -79,9 +81,60 @@ pub struct ParsedResultRecord {
   pub created_at: String,
   #[serde(default)]
   pub imported_date: String,
+  #[serde(default)]
+  pub resume_id: Option<String>,
   pub source_file: String,
   pub candidate_name: String,
+  #[serde(default)]
+  pub age: String,
+  #[serde(default)]
+  pub contact: String,
+  #[serde(default)]
+  pub position: String,
+  #[serde(default)]
+  pub degree: String,
+  #[serde(default)]
+  pub work_years: String,
+  #[serde(default)]
+  pub skills: Vec<String>,
   pub json_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedJdScoreRecord {
+  pub parsed_id: String,
+  #[serde(default)]
+  pub resume_id: Option<String>,
+  pub candidate_name: String,
+  pub source_file: String,
+  #[serde(default)]
+  pub age: String,
+  #[serde(default)]
+  pub contact: String,
+  #[serde(default)]
+  pub position: String,
+  #[serde(default)]
+  pub degree: String,
+  #[serde(default)]
+  pub work_years: String,
+  #[serde(default)]
+  pub skills: Vec<String>,
+  pub score: i32,
+  #[serde(default)]
+  pub score_breakdown: JdScoreBreakdown,
+  pub matched_keywords: Vec<String>,
+  pub total_keywords: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JdScoreBreakdown {
+  pub skill_score: i32,
+  pub years_score: i32,
+  pub degree_score: i32,
+  pub work_score: i32,
+  pub project_score: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

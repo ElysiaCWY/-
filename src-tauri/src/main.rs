@@ -9,7 +9,7 @@ mod validate;
 
 use crate::errors::AppError;
 use crate::llm::LlmSettings;
-use crate::schema::{AppSettings, JdRecord, JdScoreResult, ParsedResultRecord, ResumeData, ResumeRecord};
+use crate::schema::{AppSettings, JdRecord, JdScoreResult, ParsedJdScoreRecord, ParsedResultRecord, ResumeData, ResumeRecord};
 
 #[tauri::command]
 async fn extract_text(file_path: String) -> Result<String, AppError> {
@@ -34,6 +34,21 @@ fn export_js(resume_obj: ResumeData, out_path: String) -> Result<(), AppError> {
 #[tauri::command]
 fn jd_score_v1(resume_obj: ResumeData, jd_text: String) -> Result<JdScoreResult, AppError> {
   Ok(jd::score_v1(&resume_obj, &jd_text))
+}
+
+#[tauri::command]
+fn jd_score_from_local_parsed(jd_text: String) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
+  storage::jd_score_from_local_parsed(jd_text)
+}
+
+#[tauri::command]
+fn jd_filter_by_keywords(position: String, jd_text: String, limit: i32) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
+  storage::jd_filter_by_keywords_from_index(position, jd_text, limit)
+}
+
+#[tauri::command]
+fn jd_filter_by_model(position: String, jd_text: String, limit: i32) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
+  storage::jd_filter_by_model_from_parsed(position, jd_text, limit)
 }
 
 #[tauri::command]
@@ -67,8 +82,8 @@ fn load_app_settings() -> Result<AppSettings, AppError> {
 }
 
 #[tauri::command]
-fn save_parsed_result_json(source_file: String, resume_obj: ResumeData) -> Result<ParsedResultRecord, AppError> {
-  storage::save_parsed_result_json(source_file, resume_obj)
+fn save_parsed_result_json(source_file: String, resume_id: String, resume_obj: ResumeData) -> Result<ParsedResultRecord, AppError> {
+  storage::save_parsed_result_json(source_file, resume_id, resume_obj)
 }
 
 fn main() {
@@ -78,6 +93,9 @@ fn main() {
       parse_resume,
       export_js,
       jd_score_v1,
+      jd_score_from_local_parsed,
+      jd_filter_by_keywords,
+      jd_filter_by_model,
       save_resume_to_library,
       list_resume_library,
       delete_resume_record,

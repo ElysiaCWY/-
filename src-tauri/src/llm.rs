@@ -1,8 +1,9 @@
 use crate::errors::AppError;
-use crate::schema::ResumeData;
+use crate::schema::{ProjectItem, ResumeData, WorkItem};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,10 +57,14 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
     }) {
     Ok(v) => v,
     // 第二阶段失败时回退第一阶段结果，避免解析流程整体失败。
-    Err(_) => stage1_data,
+    Err(_) => stage1_data.clone(),
   };
 
-  Ok(final_data)
+  // 防止第二阶段“补全”时把第一阶段已抽到的项目条目变少。
+  let final_data = preserve_project_items(&stage1_data, final_data);
+
+  let grounded = filter_resume_by_source_text(final_data, text);
+  Ok(grounded)
 }
 
 fn build_stage1_prompt(tpl: &str, text: &str) -> String {
@@ -75,7 +80,9 @@ fn build_stage1_prompt(tpl: &str, text: &str) -> String {
 1. 严格按模板字段输出，不要新增或删除字段。
 2. 工作经历与项目经历要尽量完整枚举，按时间倒序。
 3. 本阶段优先保证结构完整和分段正确，description/projectAchievements 可简写。
-4. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+4. 项目经历必须尽可能完整抽取（来自“项目经历/项目经验/项目描述”等章节），不要遗漏条目。
+5. 严禁混入其他候选人的信息；若原文无证据，不得编造。
+6. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
 
 简历内容：
 """{text}""""#,
@@ -101,7 +108,9 @@ fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
 要求：
 1. 保持 workExperience / projectExperience 的条目结构，不要把多段经历合并成一段。
 2. 可补充 description / projectDescription / projectAchievements 的细节，但不要编造不存在的公司/项目。
-3. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+3. projectExperience 的条目数量不得少于第一阶段，不能因为补全而删减已有项目。
+4. 严禁混入其他候选人的信息；只有简历原文可找到依据的经历才能保留。
+5. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
 
 简历内容：
 """{text}""""#,
@@ -276,6 +285,10 @@ fn repair_resume_value(v: &mut Value) {
   alias_field(&mut root, "project_experience", "projectExperience");
 
   if let Some(mut basic_obj) = root.get("basicInfo").and_then(|x| x.as_object()).cloned() {
+    alias_field(&mut basic_obj, "phone", "contact");
+    alias_field(&mut basic_obj, "mobile", "contact");
+    alias_field(&mut basic_obj, "tel", "contact");
+    alias_field(&mut basic_obj, "联系方式", "contact");
     if !root.contains_key("workExperience") {
       if let Some(misplaced) = basic_obj.remove("workExperience").or_else(|| basic_obj.remove("work_experience")) {
         root.insert("workExperience".to_string(), misplaced);
@@ -362,6 +375,7 @@ fn sanitize_basic_info(root: &mut Map<String, Value>) {
 
   ensure_string_key(&mut basic, "name");
   ensure_string_key(&mut basic, "age");
+  ensure_string_key(&mut basic, "contact");
   ensure_string_key(&mut basic, "gender");
 
   match basic.get("skills") {
@@ -423,6 +437,155 @@ fn sanitize_indexed_items(value: &mut Value, required_keys: &[&str]) {
 
     *item = Value::Object(obj);
   }
+}
+
+fn preserve_project_items(stage1: &ResumeData, mut final_data: ResumeData) -> ResumeData {
+  let s1 = count_non_empty_projects(&stage1.project_experience);
+  let s2 = count_non_empty_projects(&final_data.project_experience);
+  if s1 > 0 && s2 < s1 {
+    final_data.project_experience = stage1.project_experience.clone();
+  }
+  final_data
+}
+
+fn count_non_empty_projects(items: &BTreeMap<String, ProjectItem>) -> usize {
+  items
+    .values()
+    .filter(|p| {
+      !p.project_name.trim().is_empty()
+        || !p.project_description.trim().is_empty()
+        || !p.project_achievements.trim().is_empty()
+    })
+    .count()
+}
+
+fn filter_resume_by_source_text(mut data: ResumeData, source_text: &str) -> ResumeData {
+  let text_norm = normalize_match_text(source_text);
+
+  let filtered_work = filter_work_experience(&data.work_experience, &text_norm);
+  if !filtered_work.is_empty() {
+    data.work_experience = filtered_work;
+  }
+
+  let filtered_project = filter_project_experience(&data.project_experience, &text_norm);
+  if !filtered_project.is_empty() {
+    data.project_experience = filtered_project;
+  }
+
+  data
+}
+
+fn filter_work_experience(input: &BTreeMap<String, WorkItem>, text_norm: &str) -> BTreeMap<String, WorkItem> {
+  let mut kept: Vec<WorkItem> = Vec::new();
+  for item in input.values() {
+    if keep_work_item(item, text_norm) {
+      kept.push(item.clone());
+    }
+  }
+  to_indexed_work_map(kept)
+}
+
+fn filter_project_experience(input: &BTreeMap<String, ProjectItem>, text_norm: &str) -> BTreeMap<String, ProjectItem> {
+  let mut kept: Vec<ProjectItem> = Vec::new();
+  for item in input.values() {
+    if keep_project_item(item, text_norm) {
+      kept.push(item.clone());
+    }
+  }
+  to_indexed_project_map(kept)
+}
+
+fn keep_work_item(item: &WorkItem, text_norm: &str) -> bool {
+  let company = item.company.trim();
+  let position = item.position.trim();
+  let period = item.period.trim();
+  let desc = item.description.trim();
+
+  if company.is_empty() && position.is_empty() && period.is_empty() && desc.is_empty() {
+    return true;
+  }
+
+  if has_text_evidence(company, text_norm) {
+    return true;
+  }
+  let desc_anchor = short_anchor(desc, 24);
+
+  if has_text_evidence(position, text_norm) && has_text_evidence(&desc_anchor, text_norm) {
+    return true;
+  }
+  if has_text_evidence(&desc_anchor, text_norm) {
+    return true;
+  }
+
+  false
+}
+
+fn keep_project_item(item: &ProjectItem, text_norm: &str) -> bool {
+  let name = item.project_name.trim();
+  let desc = item.project_description.trim();
+  let ach = item.project_achievements.trim();
+
+  if name.is_empty() && desc.is_empty() && ach.is_empty() {
+    return true;
+  }
+
+  // 项目名非空时默认保留，避免模型改写措辞导致“证据匹配不到”而误删。
+  if !name.is_empty() {
+    return true;
+  }
+  if has_text_evidence(&short_anchor(desc, 24), text_norm) {
+    return true;
+  }
+  if has_text_evidence(&short_anchor(ach, 24), text_norm) {
+    return true;
+  }
+
+  false
+}
+
+fn to_indexed_work_map(items: Vec<WorkItem>) -> BTreeMap<String, WorkItem> {
+  let mut out = BTreeMap::new();
+  for (i, item) in items.into_iter().enumerate() {
+    out.insert((i + 1).to_string(), item);
+  }
+  out
+}
+
+fn to_indexed_project_map(items: Vec<ProjectItem>) -> BTreeMap<String, ProjectItem> {
+  let mut out = BTreeMap::new();
+  for (i, item) in items.into_iter().enumerate() {
+    out.insert((i + 1).to_string(), item);
+  }
+  out
+}
+
+fn short_anchor(s: &str, max_chars: usize) -> String {
+  let t = s.trim();
+  if t.is_empty() {
+    return String::new();
+  }
+  t.chars().take(max_chars).collect()
+}
+
+fn has_text_evidence(needle: &str, text_norm: &str) -> bool {
+  let n = normalize_match_text(needle);
+  if n.chars().count() < 2 {
+    return false;
+  }
+  text_norm.contains(&n)
+}
+
+fn normalize_match_text(s: &str) -> String {
+  s.chars()
+    .filter(|c| {
+      !c.is_whitespace()
+        && !matches!(
+          c,
+          ',' | '，' | '.' | '。' | ';' | '；' | ':' | '：' | '/' | '\\' | '-' | '_' | '(' | ')' | '（' | '）' | '[' | ']' | '【' | '】' | '"' | '\''
+        )
+    })
+    .flat_map(|c| c.to_lowercase())
+    .collect::<String>()
 }
 
 fn ensure_string_key(obj: &mut Map<String, Value>, key: &str) {
