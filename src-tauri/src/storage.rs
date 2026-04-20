@@ -106,7 +106,7 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, def: &str
   }
 }
 
-fn project_root_dir() -> Result<PathBuf, AppError> {
+pub(crate) fn project_root_dir() -> Result<PathBuf, AppError> {
   let settings = settings_path()?;
   settings
     .parent()
@@ -963,6 +963,7 @@ pub fn jd_score_from_local_parsed(jd_text: String) -> Result<Vec<ParsedJdScoreRe
       degree: item.degree,
       work_years: item.work_years,
       skills: item.skills,
+      json_path: item.json_path,
       score: score.score,
       score_breakdown: crate::schema::JdScoreBreakdown::default(),
       matched_keywords: score.matched_keywords,
@@ -1081,7 +1082,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
     .prepare(
       "SELECT
         parsed_id, resume_id, source_file, candidate_name, age, contact, position, degree,
-        work_years, skills_json, work_text, project_text
+        work_years, skills_json, work_text, project_text, json_path
       FROM parsed_resumes
       WHERE (?1 = '' OR lower(position) LIKE '%' || lower(?1) || '%')
         AND (?2 <= 0 OR work_years_num >= ?2)
@@ -1114,6 +1115,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
           row.get::<_, String>(9)?,
           row.get::<_, String>(10)?,
           row.get::<_, String>(11)?,
+          row.get::<_, String>(12)?,
         ))
       },
     )
@@ -1133,6 +1135,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
       skills_json,
       work_text,
       project_text,
+      json_path,
     ) = row.map_err(|e| AppError::msg(format!("读取 SQLite 记录失败：{}", e)))?;
 
     let skills: Vec<String> = serde_json::from_str(&skills_json).unwrap_or_default();
@@ -1173,6 +1176,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
       degree,
       work_years,
       skills,
+      json_path,
       score: score.total_score,
       score_breakdown: score.breakdown,
       matched_keywords: score.matched_keywords,
@@ -1295,6 +1299,7 @@ pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: 
       degree: item.degree,
       work_years: item.work_years,
       skills: item.skills,
+      json_path: item.json_path,
       score,
       score_breakdown: crate::schema::JdScoreBreakdown::default(),
       matched_keywords,

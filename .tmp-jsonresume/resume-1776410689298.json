@@ -1,0 +1,205 @@
+{
+  "basics": {
+    "name": "谢先生",
+    "label": "",
+    "image": "",
+    "email": "",
+    "phone": "-",
+    "url": "",
+    "summary": "",
+    "location": {
+      "address": "",
+      "postalCode": "",
+      "city": "",
+      "countryCode": "CN",
+      "region": ""
+    },
+    "profiles": []
+  },
+  "work": [
+    {
+      "name": "广东万城万充电动车运营股份有限公司",
+      "position": "项目经理&后端开发",
+      "startDate": "",
+      "endDate": "2018.06-至今",
+      "summary": "负责互联互通物联网充电平台架构设计，输出相关设计文档；拆分平台子系统，完成任务分解、工作分工及进度推进；搭建基于SpringBoot+SpringCloud+MyBatisPlus+Maven+MySQL的微服务框架，编写核心代码：结合Kafka消息队列、Redis缓存技术实现不同运营商充电设备的高效接入；制定项目相关规范、负责平台代码质量审查以及Git分支管理。",
+      "highlights": []
+    },
+    {
+      "name": "天舟通信技术有限公司",
+      "position": "合伙人",
+      "startDate": "",
+      "endDate": "2015.06-2016.07",
+      "summary": "1.鞋垫定制020软件平台项目负责人：需求分解、原型设计、项目计划的编制以及设计文档的编写；负责基于SSH框架的Java后端开发与部署；负责MySQL数据库的搭建与部署，解决出现的各种乱码问题；负责Android端APP的开发，熟练使用Android控件及其布局、多线程、视频播放、文件上传、数据存储；实现Android端APP的微信支付功能，并针对微信公众号开发实现订单状态跟踪；集成Android端APP的支付宝支付功能：采用HTTP协议实现Android端与后端进行通信。2.家用医疗软件平台项目负责人：负责数据库方案设计、项目计划的编制与进度跟踪；负责基于SSH框架的Java后端开发与部署，熟练使用Struts、Spring、Hibernate等技术或工具；负责平台中不同角色的Web前端开发，熟悉HTML、CSS、Javascript、AJAX、JSON等Web页面技术；集成基于百度SDK的消息推送功能以及基于电信的短信验证码功能。",
+      "highlights": []
+    }
+  ],
+  "education": [
+    {
+      "institution": "华南理工大学",
+      "area": "机械制造与自动化",
+      "studyType": "硕士",
+      "startDate": "",
+      "endDate": "2005-2008",
+      "score": "",
+      "courses": []
+    },
+    {
+      "institution": "三峡大学",
+      "area": "机械设计制造及其自动化",
+      "studyType": "本科",
+      "startDate": "",
+      "endDate": "2001-2005",
+      "score": "",
+      "courses": []
+    }
+  ],
+  "skills": [
+    {
+      "name": "Java",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "Golang",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "SpringBoot",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "SpringCloud",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "MyBatisPlus",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "Maven",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "MySQL",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "Kafka",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "Redis",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "Netty",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "K8S",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "GitLab",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "Docker",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "C#",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "C++",
+      "level": "",
+      "keywords": []
+    },
+    {
+      "name": "JavaScript",
+      "level": "",
+      "keywords": []
+    }
+  ],
+  "projects": [
+    {
+      "name": "非涉案财物管理系统",
+      "description": "项目负责人",
+      "highlights": [
+        "搜集需求，分析客户需求，参与原型设计制定工作计划并把控项目进度；负责以SpringMVC+Hibernate+Easyui+MySQL为基础架构的非涉案财物管理系统的设计与开发；针对涉案人员随身物品与现金的分别管理实现随身物品的采集、入库、移库、归还以及个人的消费核算；实现根据用户、角色配置不同的基础权限；采用JasperReport+iReport制作报表；使用Lodop实现表单打印；采用Quartz实现定时更新任务。"
+      ],
+      "keywords": [],
+      "startDate": "",
+      "endDate": "",
+      "url": ""
+    },
+    {
+      "name": "RFID涉案财物管理系统",
+      "description": "项目负责人",
+      "highlights": [
+        "分析客户需求，编写需求设计文档，参与原型设计，制定工作计划并进行任务分工；参与基于net采用C/S架构的涉案财物管理系统的设计与开发，包含EF实体框架、WCF通信、OCX控件等技术的开发，集成摄像头、读写器、网络控制器等多种硬件设备；系统的现场部署、调试以及问题的修改；按照要求配置华三交换机，划分VLAN；搭建公司SVN环境，管控项目文档及源代码，并依据不同角色设置不同的权限；实现基于SpringMVC的转发服务的设计与开发。"
+      ],
+      "keywords": [],
+      "startDate": "",
+      "endDate": "",
+      "url": ""
+    },
+    {
+      "name": "矿井人员定位系统",
+      "description": "项目成员&项目负责人",
+      "highlights": [
+        "负责人脸识别机、道闸以及LED屏等第三方硬件设备的系统集成；熟练掌握C#调用C++动态库；遵照矿安论证的具体要求，测试验证本系统；针对用户需求，定制矿用室外定位系统；研究MapX技术，利用C#组件封装技术实现实时打点、地图测距、缩放以及鹰眼等地图操作功能；熟悉系统的整体架构以及基于net的客户端与服务器内部的基本框架。"
+      ],
+      "keywords": [],
+      "startDate": "",
+      "endDate": "",
+      "url": ""
+    },
+    {
+      "name": "人员定位安防系统",
+      "description": "项目负责人",
+      "highlights": [
+        "负责该项目从立项、开发、自检到结项的整个过程；遵照CMMI的流程编写软件需求文档、设计文档以及各环节的评审文档；设计SQLServer数据库并编写文档；强化TCP/UDP网络通信技术的理解；基于C#的硬件模拟器的设计与开发，实现对上位机系统的压力测试。"
+      ],
+      "keywords": [],
+      "startDate": "",
+      "endDate": "",
+      "url": ""
+    },
+    {
+      "name": "物联网应用平台项目",
+      "description": "项目成员",
+      "highlights": [
+        "负责该项目中基于C++通信服务器的升级更新以及维护；熟悉通信服务器的整体框架，设计并实现基于MFC的物联网应用平台UI界面；生成即时日志文件，跟踪程序运行状况，解析与显示实时通信日志；完善基于QT的物联网测试平台，并能对上层软件执行压力测试。"
+      ],
+      "keywords": [],
+      "startDate": "",
+      "endDate": "",
+      "url": ""
+    }
+  ],
+  "certificates": [],
+  "languages": [],
+  "interests": [],
+  "references": [],
+  "meta": {
+    "canonical": "",
+    "version": "v1.0.0",
+    "lastModified": ""
+  }
+}

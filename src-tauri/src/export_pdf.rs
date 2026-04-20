@@ -36,6 +36,7 @@ fn try_load_windows_cjk_font(doc: &mut PdfDocument) -> Option<PdfFontHandle> {
 enum LineKind {
   H1,
   H2,
+  Divider,
   Normal,
 }
 
@@ -203,6 +204,7 @@ fn split_numbered_sections(text: &str) -> Vec<String> {
 
 fn parse_and_wrap_lines(content: &str) -> Vec<RenderLine> {
   let mut lines: Vec<RenderLine> = Vec::new();
+  let mut seen_section = false;
   for raw in preprocess_lines_for_time_tail(content) {
     let line = raw.trim_end();
     if line.trim().is_empty() {
@@ -224,12 +226,19 @@ fn parse_and_wrap_lines(content: &str) -> Vec<RenderLine> {
     }
 
     if let Some(rest) = line.strip_prefix("## ") {
+      if seen_section {
+        lines.push(RenderLine {
+          text: "────────────────────────────────────────────────────────".to_string(),
+          kind: LineKind::Divider,
+        });
+      }
       for x in wrap_by_units(rest.trim(), 40.0) {
         lines.push(RenderLine {
           text: x,
           kind: LineKind::H2,
         });
       }
+      seen_section = true;
       continue;
     }
 
@@ -281,15 +290,17 @@ fn parse_and_wrap_lines(content: &str) -> Vec<RenderLine> {
 fn line_height_for(kind: LineKind) -> f32 {
   match kind {
     LineKind::H1 => 26.0,
-    LineKind::H2 => 19.0,
+    LineKind::H2 => 18.0,
+    LineKind::Divider => 10.0,
     LineKind::Normal => 14.0,
   }
 }
 
 fn font_size_for(kind: LineKind) -> f32 {
   match kind {
-    LineKind::H1 => 22.0,
-    LineKind::H2 => 14.0,
+    LineKind::H1 => 24.0,
+    LineKind::H2 => 15.0,
+    LineKind::Divider => 9.0,
     LineKind::Normal => 11.0,
   }
 }
@@ -329,7 +340,13 @@ pub fn write_resume_pdf(content: &str, out_path: &str) -> Result<(), AppError> {
     });
     for line in page_lines {
       let line_height = line_height_for(line.kind);
-      let extra_gap = if matches!(line.kind, LineKind::H1 | LineKind::H2) { 4.0 } else { 0.0 };
+      let extra_gap = if matches!(line.kind, LineKind::H1 | LineKind::H2) {
+        4.0
+      } else if matches!(line.kind, LineKind::Divider) {
+        2.0
+      } else {
+        0.0
+      };
       ops.push(Op::SetFont {
         font: font.clone(),
         size: Pt(font_size_for(line.kind)),
@@ -350,3 +367,4 @@ pub fn write_resume_pdf(content: &str, out_path: &str) -> Result<(), AppError> {
   doc.save_writer(&mut writer, &PdfSaveOptions::default(), &mut warnings);
   Ok(())
 }
+

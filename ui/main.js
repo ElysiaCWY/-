@@ -20,6 +20,21 @@ function saveDialog(options) {
   return ensureDesktopApi("dialog.save", saveFn)(options);
 }
 
+/**
+ * 测试/调试：同时输出到控制台并追加到本地 app.log（路径见 get_app_log_path）。
+ * 在 DevTools 中也可调用 window.appLog("debug", "步骤", obj)。
+ */
+function appLog(level, ...parts) {
+  const msg = parts
+    .map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+    .join(" ");
+  const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
+  fn(`[app] ${msg}`);
+  if (!invokeFn) return;
+  const lvl = ["error", "warn", "debug", "info"].includes(level) ? level : "info";
+  invoke("append_app_log", { level: lvl, message: msg }).catch(() => {});
+}
+
 const $ = (id) => document.getElementById(id);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
@@ -158,21 +173,49 @@ function bindQuickActions() {
   });
 
   $("tplRegenerate")?.addEventListener("click", updateTemplatePreview);
-  $("tplExportWord")?.addEventListener("click", () => alert("桌面版原型：Word 导出将于下一阶段接入。"));
   $("tplExportPdf")?.addEventListener("click", async () => {
     try {
-      const content = (templatePreview?.textContent || "").trim();
-      if (!content || content.includes("请先在上方“候选人选择”勾选")) {
+      const { selectedRows, selectedRecords } = getSelectedTemplateResolvedRecords();
+      if (!selectedRows.length || !selectedRecords.length) {
         alert("请先选择候选人并生成预览内容。");
         return;
       }
+      const firstName = sanitizeFileName(selectedRecords[0]?.data?.basicInfo?.name || selectedRecords[0]?.row?.candidateName || "标准简历");
       const outPath = await saveDialog({
-        defaultPath: "standard_resumes.pdf",
+        defaultPath: `${firstName}.pdf`,
         filters: [{ name: "PDF", extensions: ["pdf"] }],
       });
       if (!outPath) return;
-      await invoke("export_resume_pdf", { content, outPath });
-      alert(`PDF 导出成功：${outPath}`);
+      const { dirPath, sep } = splitPathForBatch(outPath);
+      const usedNameCount = new Map();
+      let ok = 0;
+      const failed = [];
+      for (let i = 0; i < selectedRecords.length; i += 1) {
+        const item = selectedRecords[i];
+        const baseName = sanitizeFileName(item.data?.basicInfo?.name || item.row?.candidateName || `候选人${i + 1}`);
+        const seen = usedNameCount.get(baseName) || 0;
+        usedNameCount.set(baseName, seen + 1);
+        const fileName = seen === 0 ? `${baseName}.pdf` : `${baseName}_${seen + 1}.pdf`;
+        const targetPath = dirPath ? `${dirPath}${sep}${fileName}` : fileName;
+        const includeSkills = Boolean($("tplSkill")?.checked);
+        const jsonPath = String(item.row?.jsonPath || "").trim();
+        try {
+          if (jsonPath) {
+            await invoke("export_resume_pdf_from_json", { jsonPath, outPath: targetPath, includeSkills });
+          } else {
+            const content = buildTemplateBlock(item.data);
+            await invoke("export_resume_pdf", { content, outPath: targetPath });
+          }
+          ok += 1;
+        } catch (err) {
+          failed.push(`${fileName}: ${String(err)}`);
+        }
+      }
+      if (!failed.length) {
+        alert(`PDF 导出成功：共 ${ok} 份\n目录：${dirPath || "."}`);
+      } else {
+        alert(`PDF 导出完成：成功 ${ok}，失败 ${failed.length}\n${failed.slice(0, 3).join("\n")}`);
+      }
     } catch (e) {
       alert(String(e));
     }
@@ -635,69 +678,97 @@ function renderStructuredCards(resume) {
 }
 
 function updateTemplatePreview() {
-  const cleanInline = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
-  const selectedRows = getCurrentTemplateRows().filter((row) => selectedTemplateKeys.has(rowKeyForTemplate(row)));
-  const selected = selectedRows
-    .map((row) => resolveResumeRecordFromJdRow(row))
-    .filter(Boolean)
-    .map((rec) => rec.data);
-  if (!selected.length) {
+  const { selectedRows, selectedRecords } = getSelectedTemplateResolvedRecords();
+  if (!selectedRows.length || !selectedRecords.length) {
     templatePreview.textContent = "请先在上方“候选人选择”勾选要生成的简历。";
     return;
   }
-  const blocks = selected.map((src) => {
-    const b = src.basicInfo || {};
-    const workRows = Object.keys(src.workExperience || {})
-      .sort((a, b) => Number(a) - Number(b))
-      .map((k) => src.workExperience?.[k] || {})
-      .filter((x) => x.company || x.position || x.period || x.description);
-    const projectRows = Object.keys(src.projectExperience || {})
-      .sort((a, b) => Number(a) - Number(b))
-      .map((k) => src.projectExperience?.[k] || {})
-      .filter((x) => x.projectName || x.projectDescription || x.projectAchievements);
-    const lines = [];
-    lines.push(`# ${cleanInline(b.name) || "候选人姓名"}`);
-    lines.push("## 基础信息");
-    lines.push(`- 性别：${cleanInline(b.gender) || "-"}`);
-    lines.push(`- 年龄：${cleanInline(b.age) || "-"}`);
-    lines.push(`- 联系方式：${cleanInline(b.contact) || "-"}`);
-
-    const eduRows = Array.isArray(b.education) ? b.education.filter((e) => e?.school || e?.degree || e?.major || e?.period || e?.graduationDate) : [];
-    if (eduRows.length) {
-      lines.push("## 教育背景");
-      eduRows.forEach((e) => {
-        const period = cleanInline(e.period || e.graduationDate || "-");
-        lines.push(`- ${cleanInline(e.school) || "-"} / ${cleanInline(e.degree) || "-"} / ${cleanInline(e.major) || "-"} / ${period}`);
-      });
-    }
-
-    if ($("tplSkill")?.checked && Array.isArray(b.skills) && b.skills.length) {
-      lines.push("## 技能");
-      lines.push(`- ${(b.skills || []).map((s) => cleanInline(s)).filter(Boolean).join(" / ")}`);
-    }
-
-    if (workRows.length) {
-      lines.push("## 工作经历");
-      workRows.forEach((w) => {
-        lines.push(`- ${cleanInline(w.company) || "-"} / ${cleanInline(w.position) || "-"} / ${cleanInline(w.period) || "-"}`);
-        if (w.description) lines.push(`  - ${cleanInline(w.description)}`);
-      });
-    }
-
-    if (projectRows.length) {
-      lines.push("## 项目经历");
-      projectRows.forEach((p) => {
-        lines.push(`- ${cleanInline(p.projectName) || "-"}：${cleanInline(p.projectDescription) || "-"}`);
-        if (p.projectAchievements) lines.push(`  - 成果：${cleanInline(p.projectAchievements)}`);
-      });
-    }
-    return lines.join("\n");
-  });
-  const missingCount = Math.max(0, selectedRows.length - selected.length);
+  const blocks = selectedRecords.map((item) => buildTemplateBlock(item.data));
+  const missingCount = Math.max(0, selectedRows.length - selectedRecords.length);
   const warning = missingCount > 0
     ? `提示：有 ${missingCount} 份候选人未匹配到完整简历数据，已自动跳过。\n\n`
     : "";
   templatePreview.textContent = `${warning}${blocks.join("\n\n------------------------------\n\n")}`;
+}
+
+function cleanInline(v) {
+  return String(v ?? "").replace(/\s+/g, " ").trim();
+}
+
+function buildTemplateBlock(src) {
+  const b = src.basicInfo || {};
+  const workRows = Object.keys(src.workExperience || {})
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => src.workExperience?.[k] || {})
+    .filter((x) => x.company || x.position || x.period || x.description);
+  const projectRows = Object.keys(src.projectExperience || {})
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => src.projectExperience?.[k] || {})
+    .filter((x) => x.projectName || x.projectDescription || x.projectAchievements);
+  const lines = [];
+  lines.push(`# ${cleanInline(b.name) || "候选人姓名"}`);
+  lines.push("## 基础信息");
+  lines.push(`- 性别：${cleanInline(b.gender) || "-"}`);
+  lines.push(`- 年龄：${cleanInline(b.age) || "-"}`);
+  lines.push(`- 联系方式：${cleanInline(b.contact) || "-"}`);
+
+  const eduRows = Array.isArray(b.education) ? b.education.filter((e) => e?.school || e?.degree || e?.major || e?.period || e?.graduationDate) : [];
+  if (eduRows.length) {
+    lines.push("## 教育背景");
+    eduRows.forEach((e) => {
+      const period = cleanInline(e.period || e.graduationDate || "-");
+      lines.push(`- ${cleanInline(e.school) || "-"} / ${cleanInline(e.degree) || "-"} / ${cleanInline(e.major) || "-"} / ${period}`);
+    });
+  }
+
+  if ($("tplSkill")?.checked && Array.isArray(b.skills) && b.skills.length) {
+    lines.push("## 技能");
+    lines.push(`- ${(b.skills || []).map((s) => cleanInline(s)).filter(Boolean).join(" / ")}`);
+  }
+
+  if (workRows.length) {
+    lines.push("## 工作经历");
+    workRows.forEach((w) => {
+      lines.push(`- ${cleanInline(w.company) || "-"} / ${cleanInline(w.position) || "-"} / ${cleanInline(w.period) || "-"}`);
+      if (w.description) lines.push(`  - ${cleanInline(w.description)}`);
+    });
+  }
+
+  if (projectRows.length) {
+    lines.push("## 项目经历");
+    projectRows.forEach((p) => {
+      lines.push(`- ${cleanInline(p.projectName) || "-"}：${cleanInline(p.projectDescription) || "-"}`);
+      if (p.projectAchievements) lines.push(`  - 成果：${cleanInline(p.projectAchievements)}`);
+    });
+  }
+  return lines.join("\n");
+}
+
+function getSelectedTemplateResolvedRecords() {
+  const selectedRows = getCurrentTemplateRows().filter((row) => selectedTemplateKeys.has(rowKeyForTemplate(row)));
+  const selectedRecords = selectedRows
+    .map((row) => ({ row, rec: resolveResumeRecordFromJdRow(row) }))
+    .filter((x) => Boolean(x.rec))
+    .map((x) => ({ row: x.row, data: x.rec.data }));
+  return { selectedRows, selectedRecords };
+}
+
+function sanitizeFileName(name) {
+  const cleaned = String(name || "")
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "候选人";
+}
+
+function splitPathForBatch(path) {
+  const raw = String(path || "");
+  const slashIdx = raw.lastIndexOf("/");
+  const backslashIdx = raw.lastIndexOf("\\");
+  const idx = Math.max(slashIdx, backslashIdx);
+  if (idx < 0) return { dirPath: "", sep: "\\" };
+  const sep = idx === backslashIdx ? "\\" : "/";
+  return { dirPath: raw.slice(0, idx), sep };
 }
 
 function rowKeyForTemplate(row) {
@@ -902,7 +973,7 @@ async function handleImportClick() {
       multiple: true,
       filters: [{
         name: "Resume",
-        extensions: ["txt", "pdf", "docx", "doc", "jpg", "jpeg", "png", "md"]
+        extensions: ["docx", "pdf"]
       }]
     });
 
@@ -1156,6 +1227,13 @@ btnClear.addEventListener("click", () => {
 
 setupNav();
 bindQuickActions();
+if (invokeFn) {
+  window.appLog = appLog;
+  invoke("get_app_log_path")
+    .then((p) => console.info("[resume-manager] 测试日志文件:", p))
+    .catch(() => {});
+  appLog("info", "前端已加载");
+}
 refreshLibraryAndStats().catch((e) => console.error(e));
 refreshJdList().catch((e) => console.error(e));
 loadSettingsFromFile();

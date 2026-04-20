@@ -6,6 +6,9 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// 与 `run_ollama_json` 中 Ollama `num_ctx` 保持一致，便于日志对照
+const RESUME_PARSE_NUM_CTX: u32 = 12000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSettings {
   pub llama_cli_path: String,
@@ -16,14 +19,29 @@ pub struct LlmSettings {
 
 pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<ResumeData, AppError> {
   if settings.model_path.trim().is_empty() {
+    resume_parse_log!(error, "resume_parse: 中止，未配置模型名");
     return Err(AppError::msg("请在设置中填写 Ollama 模型名，例如 qwen2.5:3b"));
   }
 
   if looks_like_gguf_path(&settings.model_path) {
+    resume_parse_log!(error, "resume_parse: 中止，modelPath 不能为 .gguf 路径");
     return Err(AppError::msg(
       "当前已切换为 Ollama 调用，modelPath 需要填写模型名（如 qwen2.5:3b），不再支持 .gguf 文件路径",
     ));
   }
+
+  let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
+  let text_chars = text.chars().count();
+  resume_parse_log!(
+    info,
+    "resume_parse: 开始 model={} ollama_base={} text_chars={} num_ctx={} threads={} temp={}",
+    settings.model_path.trim(),
+    base_url,
+    text_chars,
+    RESUME_PARSE_NUM_CTX,
+    settings.threads,
+    settings.temperature
+  );
 
   let tpl_path = resolve_template_path("解析结果模板.json")?;
   let tpl_content = std::fs::read_to_string(&tpl_path).map_err(|e| {
@@ -37,33 +55,92 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
 
   // 第一阶段：先抽取稳定结构（公司/职位/时间段/项目名称等骨架信息）
   let stage1_prompt = build_stage1_prompt(&tpl_for_prompt, text);
-  let stage1_json = run_ollama_json(&stage1_prompt, settings)?;
+  resume_parse_log!(
+    debug,
+    "resume_parse: stage1_prompt_chars={}",
+    stage1_prompt.chars().count()
+  );
+  let stage1_json = run_ollama_json("stage1", &stage1_prompt, settings)?;
+  resume_parse_log!(
+    debug,
+    "resume_parse: stage1 模型原始 JSON 长度={}",
+    stage1_json.chars().count()
+  );
   let stage1_data = parse_resume_data_flexible(&stage1_json).map_err(|e| {
+    resume_parse_log!(
+      error,
+      "resume_parse: stage1 反序列化失败 err={} json_prefix={}",
+      e,
+      clip(&stage1_json, 800)
+    );
     AppError::msg(format!(
       "第一阶段反序列化失败：{}\nJSON原文：{}",
       e,
       clip(&stage1_json, 1200)
     ))
   })?;
+  resume_parse_log!(
+    info,
+    "resume_parse: stage1 成功 work_entries={} project_entries={}",
+    stage1_data.work_experience.len(),
+    stage1_data.project_experience.len()
+  );
 
   // 第二阶段：基于第一阶段骨架补全描述细节，提升内容质量
   let stage1_seed = serde_json::to_string_pretty(&stage1_data)
     .unwrap_or_else(|_| stage1_json.clone());
   let stage2_prompt = build_stage2_prompt(&tpl_for_prompt, text, &stage1_seed);
+  resume_parse_log!(
+    debug,
+    "resume_parse: stage2_prompt_chars={} stage1_seed_chars={}",
+    stage2_prompt.chars().count(),
+    stage1_seed.chars().count()
+  );
 
-  let final_data = match run_ollama_json(&stage2_prompt, settings)
-    .and_then(|json| {
-      parse_resume_data_flexible(&json).map_err(AppError::msg)
-    }) {
-    Ok(v) => v,
-    // 第二阶段失败时回退第一阶段结果，避免解析流程整体失败。
-    Err(_) => stage1_data.clone(),
+  let final_data = match run_ollama_json("stage2", &stage2_prompt, settings).and_then(|json| {
+    let n = json.chars().count();
+    parse_resume_data_flexible(&json).map_err(|e| {
+      resume_parse_log!(
+        warn,
+        "resume_parse: stage2 JSON 反序列化失败 len={} err={} json_prefix={}",
+        n,
+        e,
+        clip(&json, 600)
+      );
+      AppError::msg(e)
+    })
+  }) {
+    Ok(v) => {
+      resume_parse_log!(
+        info,
+        "resume_parse: stage2 成功 work_entries={} project_entries={}",
+        v.work_experience.len(),
+        v.project_experience.len()
+      );
+      v
+    }
+    Err(e) => {
+      resume_parse_log!(
+        warn,
+        "resume_parse: stage2 未采用，回退 stage1 结果。原因: {}",
+        e
+      );
+      stage1_data.clone()
+    }
   };
 
-  // 防止第二阶段“补全”时把第一阶段已抽到的项目条目变少。
+  // 防止第二阶段“补全”时把第一阶段已抽到的项目/工作经历条目变少。
   let final_data = preserve_project_items(&stage1_data, final_data);
+  let final_data = preserve_work_items(&stage1_data, final_data);
 
   let grounded = filter_resume_by_source_text(final_data, text);
+  resume_parse_log!(
+    info,
+    "resume_parse: 完成（过滤后）name={:?} work_entries={} project_entries={}",
+    grounded.basic_info.name,
+    grounded.work_experience.len(),
+    grounded.project_experience.len()
+  );
   Ok(grounded)
 }
 
@@ -120,7 +197,7 @@ fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
   )
 }
 
-fn run_ollama_json(prompt: &str, settings: &LlmSettings) -> Result<String, AppError> {
+fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<String, AppError> {
   let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
   let endpoint = format!("{}/api/generate", base_url);
 
@@ -131,15 +208,30 @@ fn run_ollama_json(prompt: &str, settings: &LlmSettings) -> Result<String, AppEr
     "stream": false,
     "options": {
       "temperature": settings.temperature,
-      "num_ctx": 8000,
+      "num_ctx": RESUME_PARSE_NUM_CTX,
       "num_thread": settings.threads,
     }
   });
+
+  resume_parse_log!(
+    debug,
+    "resume_parse: [{}] POST {} prompt_chars={}",
+    label,
+    endpoint,
+    prompt.chars().count()
+  );
 
   let resp = ureq::post(&endpoint)
     .set("Content-Type", "application/json")
     .send_json(body)
     .map_err(|e| {
+      resume_parse_log!(
+        error,
+        "resume_parse: [{}] HTTP 请求失败 {} err={}",
+        label,
+        base_url,
+        e
+      );
       AppError::msg(format!(
         "调用 Ollama 失败：{}。请确认 Ollama 已启动（ollama serve）且地址可访问：{}",
         e, base_url
@@ -148,14 +240,36 @@ fn run_ollama_json(prompt: &str, settings: &LlmSettings) -> Result<String, AppEr
 
   let payload: Value = resp
     .into_json()
-    .map_err(|e| AppError::msg(format!("解析 Ollama 响应失败：{}", e)))?;
+    .map_err(|e| {
+      resume_parse_log!(
+        error,
+        "resume_parse: [{}] 解析 Ollama JSON 响应失败: {}",
+        label,
+        e
+      );
+      AppError::msg(format!("解析 Ollama 响应失败：{}", e))
+    })?;
 
   let raw_text = payload
     .get("response")
     .and_then(|v| v.as_str())
-    .ok_or_else(|| AppError::msg(format!("Ollama 响应缺少 response 字段：{}", payload)))?;
+    .ok_or_else(|| {
+      resume_parse_log!(
+        error,
+        "resume_parse: [{}] 响应缺少 response 字段 payload={}",
+        label,
+        payload
+      );
+      AppError::msg(format!("Ollama 响应缺少 response 字段：{}", payload))
+    })?;
 
   extract_json_object(raw_text).ok_or_else(|| {
+    resume_parse_log!(
+      error,
+      "resume_parse: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
+      label,
+      clip(raw_text, 800)
+    );
     AppError::msg(format!(
       "模型输出中未找到 JSON 对象。原始输出前800字符：{}",
       clip(raw_text, 800)
@@ -384,12 +498,46 @@ fn sanitize_basic_info(root: &mut Map<String, Value>) {
       basic.insert("skills".to_string(), Value::Array(vec![]));
     }
   }
-  match basic.get("certificates") {
-    Some(Value::Array(_)) => {}
-    _ => {
-      basic.insert("certificates".to_string(), Value::Array(vec![]));
-    }
-  }
+
+  // 证书：模板要求 Vec<String>，模型常输出 [{ "name": "...", "period": "..." }, ...]
+  let cert_raw = basic.remove("certificates");
+  let cert_arr = match cert_raw {
+    Some(Value::Array(arr)) => arr
+      .into_iter()
+      .filter_map(|item| match item {
+        Value::String(s) => {
+          let t = s.trim();
+          if t.is_empty() {
+            None
+          } else {
+            Some(Value::String(s))
+          }
+        }
+        Value::Object(o) => {
+          let name = o
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+          let period = o
+            .get("period")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+          let s = match (name.is_empty(), period.is_empty()) {
+            (true, true) => return None,
+            (false, true) => name.to_string(),
+            (true, false) => period.to_string(),
+            (false, false) => format!("{}（{}）", name, period),
+          };
+          Some(Value::String(s))
+        }
+        _ => None,
+      })
+      .collect::<Vec<_>>(),
+    _ => vec![],
+  };
+  basic.insert("certificates".to_string(), Value::Array(cert_arr));
 
   let edu = basic.get("education").cloned().unwrap_or(Value::Array(vec![]));
   let mut edu_arr = match edu {
@@ -448,6 +596,34 @@ fn preserve_project_items(stage1: &ResumeData, mut final_data: ResumeData) -> Re
   final_data
 }
 
+/// 第二阶段模型常把多段工作经历合并成更少条目；若条数变少则回退第一阶段骨架（与 `preserve_project_items` 对称）。
+fn preserve_work_items(stage1: &ResumeData, mut final_data: ResumeData) -> ResumeData {
+  let s1 = count_non_empty_work(&stage1.work_experience);
+  let s2 = count_non_empty_work(&final_data.work_experience);
+  if s1 > s2 {
+    resume_parse_log!(
+      warn,
+      "resume_parse: stage2 工作经历条数少于 stage1（{} < {}），回退 stage1 工作经历",
+      s2,
+      s1
+    );
+    final_data.work_experience = stage1.work_experience.clone();
+  }
+  final_data
+}
+
+fn count_non_empty_work(items: &BTreeMap<String, WorkItem>) -> usize {
+  items
+    .values()
+    .filter(|w| {
+      !w.company.trim().is_empty()
+        || !w.position.trim().is_empty()
+        || !w.period.trim().is_empty()
+        || !w.description.trim().is_empty()
+    })
+    .count()
+}
+
 fn count_non_empty_projects(items: &BTreeMap<String, ProjectItem>) -> usize {
   items
     .values()
@@ -502,6 +678,11 @@ fn keep_work_item(item: &WorkItem, text_norm: &str) -> bool {
   let desc = item.description.trim();
 
   if company.is_empty() && position.is_empty() && period.is_empty() && desc.is_empty() {
+    return true;
+  }
+
+  // 与项目经历一致：公司或职位非空时默认保留，避免原文标点/空格差异导致子串匹配失败而误删整条经历。
+  if !company.is_empty() || !position.is_empty() {
     return true;
   }
 

@@ -13,7 +13,7 @@
 - 桌面框架：Tauri 1.x
 - 后端：Rust 2021
 - 前端：原生 HTML + CSS + JavaScript
-- 模型调用：Ollama 本地服务（`http://127.0.0.1:11434`）
+- 模型调用：Ollama 本地服务（默认 `http://127.0.0.1:11434`）
 
 关键依赖（后端）：
 
@@ -23,17 +23,19 @@
 - `regex`：文本清洗与关键词处理
 - `dirs`：本地数据目录定位
 - `rusqlite`：SQLite（解析结果索引库，用于 JD 筛选）
+- `log` + `env_logger`：控制台日志；解析相关行同时写入项目内 `logs/app.log`（见下文「日志」）
 
 ## 目录结构（核心）
 
 - `src-tauri/src/main.rs`：Tauri 命令注册与入口
 - `src-tauri/src/extract/`：简历文件文本抽取
-- `src-tauri/src/llm.rs`：调用本地模型进行结构化解析
+- `src-tauri/src/llm.rs`：调用本地模型进行结构化解析（两阶段、结果归一与来源过滤）
 - `src-tauri/src/jd.rs`：JD 需求结构化与加权评分（含旧版关键词 v1 接口）
 - `src-tauri/src/storage.rs`：本地 JSON 存储、SQLite、解析归档与去重
 - `src-tauri/src/schema.rs`：数据结构定义
 - `src-tauri/src/validate.rs`：解析结果规范化
 - `src-tauri/src/export_js.rs`：导出 `resume_data.js`
+- `src-tauri/src/app_log.rs`：应用日志落盘（含 `resume_parse` 宏）
 - `ui/dashboard.html`：前端单页入口（包含各功能区块）
 - `ui/main.js`：前端交互与 Tauri 命令调用
 - `ui/style.css`：界面样式
@@ -56,25 +58,29 @@
 - `.doc`（提示先转 `.docx`）
 - 图片类 `.png/.jpg/.jpeg/.webp`（OCR 暂未启用）
 
+前端「导入与解析」文件选择器当前仅开放 **`.docx`、`.pdf`**，与上述能力一致。
+
 ### 2. 本地模型结构化解析
 
 后端命令：`parse_resume(text, settings)`
 
 解析策略：
 
-- 基于 Ollama `/api/generate` 的两阶段解析：
-  - 第一阶段：优先抽取稳定结构（公司/岗位/时间段/项目名等）
-  - 第二阶段：在第一阶段骨架上补全描述细节
-- 第二阶段失败时自动回退第一阶段结果，避免整条任务失败
-- 提取 JSON 并转换为统一结构；`basicInfo` 支持联系方式字段 `contact`（模型亦可能输出 `phone`/`mobile` 等别名，会归一到 `contact`）
-- 解析后做字段规范化（空值补全、索引重排、去空白、工作经历按公司合并等）
+- 基于 Ollama `/api/generate` 的 **两阶段** 解析：
+  - **第一阶段**：优先抽取稳定结构（公司/岗位/时间段/项目名等）
+  - **第二阶段**：在第一阶段骨架上补全描述细节
+- **第二阶段失败**时自动回退第一阶段结果，避免整条任务失败
+- **第二阶段若将工作经历条数变少**，会 **回退第一阶段的工作经历**（避免模型合并/删减导致只剩一条）
+- 简历解析请求中 Ollama **`num_ctx` 为 12000**（可按机器与模型能力在 `llm.rs` 中调整）
+- 提取 JSON 后做结构修复与归一（如 `basicInfo` 的 `phone`/`mobile` 等别名归一到 `contact`；证书字段若被模型输出为 `{name,period}` 对象数组，会合并为字符串以符合 `Vec<String>`）
+- 解析结束后对来源文本做 **证据过滤**：项目经历在「项目名非空」时默认保留；工作经历在「公司或职位非空」时默认保留，减少原文与模型措辞略不一致时的误删
 
-设置项：
+设置项（见 `app-config.json`）：
 
-- `llama_cli_path`
-- `model_path`
-- `threads`
-- `temperature`
+- `llamaCliPath`：Ollama 服务地址
+- `modelPath`：Ollama 模型名
+- `threads`：推理线程数
+- `temperature`：采样温度
 
 ### 3. 结果导出与落盘
 
@@ -82,6 +88,7 @@
 
 - `save_parsed_result_json(source_file, resume_obj)`
 - `export_js(resume_obj, out_path)`（仍保留，按需手动导出）
+- `export_resume_pdf` / `export_resume_pdf_from_json`：标准简历模板 **PDF** 导出（JD 页「生成标准简历」流程）
 
 默认行为（推荐流程）：
 
@@ -144,6 +151,13 @@
 - `threads`：推理线程数
 - `temperature`：采样温度
 
+## 日志（排查解析与接口问题）
+
+- **控制台**：通过 `env_logger` 输出；启动前可设置环境变量 **`RUST_LOG`**，例如 `RUST_LOG=resume_manager=info` 或 `resume_manager=debug`（Windows PowerShell：`$env:RUST_LOG="resume_manager=debug"`）。
+- **文件**：`<项目根>/logs/app.log`（项目根与 `app-config.json` 所在目录一致）。
+  - 前端 `appLog` 与部分后端逻辑会追加写入该文件。
+  - **简历解析**相关行带前缀 `resume_parse:` / `parse_resume:`，且与控制台 `log` **双写**，便于在无控制台窗口的打包版中排查。
+
 ## 数据存储位置
 
 **应用数据目录（仍为系统本地目录）：**
@@ -158,6 +172,7 @@
 - 首次使用若仅在旧位置存在 `resumes.db`，会自动 **复制迁移** 到 `data/resumes.db`（旧文件不强制删除）
 - `parsed-results/`：每次解析成功后自动保存的结构化 JSON（按岗位子文件夹归档）
 - `parsed-results/parsed-index.json`：解析结果索引（含来源文件、候选人名、导入日期、JSON 路径等）
+- `logs/app.log`：应用与解析诊断日志（见上文「日志」）
 
 **项目根目录文件：**
 
@@ -183,18 +198,19 @@
 ## 使用流程（建议）
 
 1. 编辑项目根目录 `app-config.json`，填写 `llamaCliPath` 与 `modelPath`
-2. 到「导入与解析」批量导入简历文件并抽取文本
+2. 到「导入与解析」批量导入 **docx / pdf** 并抽取文本
 3. 点击「开始批量解析」
 4. 系统自动执行：解析 -> 简历库入库 -> 保存解析 JSON -> **写入/更新 `data/resumes.db`**
 5. 到「简历库」按姓名/学历/技能筛选，查看结构化详情或删除记录
 6. 在「JD 管理筛选」输入岗位并粘贴 JD，计算结构化匹配分（先 SQL 预过滤再加权排序）
-7. 需要时手动导出 `resume_data.js`
+7. 需要时手动导出 `resume_data.js`，或在 JD 页使用 **标准简历模板导出 PDF**
 
 ## 前端交互更新（当前版本）
 
 - 解析区：
   - 队列化批处理与进度展示
   - 支持导入后连续批量解析
+  - 导入类型说明与选择器为 **docx、pdf**
 - 简历库：
   - 列字段：姓名/性别/年龄/最高学历/岗位/工作年限/导入日期/查看详情/删除
   - 支持删除简历记录（联动清理索引与 SQLite）
@@ -203,21 +219,20 @@
   - 详情内容做 HTML 转义处理，避免渲染注入
 - JD 筛选：
   - 匹配结果展示总分及分项分数简写
+  - 标准简历模板支持 **导出 PDF**（多选候选人时批量落盘到所选目录）
 
 ## 当前已知限制
 
 - OCR 尚未启用：图片简历不能直接解析
-- `.doc` 尚不直接支持
+- `.doc` 尚不直接支持（需先另存为 `.docx`）
 - JD 匹配依赖本地模型提取结构化需求，模型或配置异常时可能影响筛选质量
 - 同人去重依赖 **姓名+年龄+联系方式** 三者齐全；若简历未解析出联系方式，则不会触发该去重逻辑
-- 模板导出 Word/PDF 在前端仍为占位交互
-- 长简历在本地模型上仍可能偶发输出不完整（已做两阶段与回退兜底）
+- 超长简历仍受 **模型上下文长度** 与输出稳定性影响；已使用较大 `num_ctx`、两阶段与工作经历条数回退等兜底，极端长文仍可能不完整
 - 当前前端为单页结构，统一在 `dashboard.html` + `main.js` 中完成页面切换与交互
 
 ## 后续建议
 
 - 接入离线 OCR（如 PaddleOCR/Tesseract）以支持图片与扫描件
-- 增加 `.doc` 转换链路（本地转换后再抽取）
+- 增加 `.doc` 转换链路（本地 LibreOffice / Word 转换后再抽取）
 - 联系方式缺失时的降级去重策略（可配置）
-- 为模板导出接入真实 Word/PDF 生成能力
-- 增加日志与错误诊断页，便于排查模型路径与解析失败问题
+- 按需继续调大 `num_ctx` 或分段解析策略，以适配更长简历

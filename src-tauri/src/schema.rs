@@ -120,6 +120,8 @@ pub struct ParsedJdScoreRecord {
   pub work_years: String,
   #[serde(default)]
   pub skills: Vec<String>,
+  #[serde(default)]
+  pub json_path: String,
   pub score: i32,
   #[serde(default)]
   pub score_breakdown: JdScoreBreakdown,
