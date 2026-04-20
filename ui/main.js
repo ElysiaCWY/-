@@ -96,6 +96,7 @@ const TITLE_MAP = {
   dashboard: "首页概览",
   library: "简历库",
   parse: "简历导入 & 解析",
+  word2pdf: "Word 转 PDF",
   jd: "JD 管理 & 筛选",
   jdCompareReport: "候选人对比报告",
   resumeDetail: "简历详情",
@@ -224,6 +225,130 @@ function bindQuickActions() {
   $("jdCompareBtn")?.addEventListener("click", () => {
     renderJdCompareReport(lastJdRankingRows);
     jumpToStandalonePage("jdCompareReport");
+  });
+}
+
+function bindWord2Pdf() {
+  const inp = $("word2pdfInputDir");
+  const out = $("word2pdfOutputDir");
+  const btnIn = $("word2pdfBrowseIn");
+  const btnOut = $("word2pdfBrowseOut");
+  const btnStart = $("word2pdfStart");
+  const btnDef = $("word2pdfDefaults");
+  const phase = $("word2pdfPhase");
+  const frac = $("word2pdfFraction");
+  const bar = $("word2pdfBar");
+  const logEl = $("word2pdfLog");
+  const summary = $("word2pdfSummary");
+  if (!inp || !out || !btnStart || !phase || !frac || !bar || !logEl || !summary) return;
+
+  let running = false;
+
+  async function fillDefaults() {
+    if (!invokeFn) return;
+    const [a, b] = await invoke("word_to_pdf_default_dirs");
+    inp.value = a || "";
+    out.value = b || "";
+  }
+
+  btnIn?.addEventListener("click", async () => {
+    try {
+      const sel = await openDialog({ directory: true, multiple: false });
+      if (sel && typeof sel === "string") inp.value = sel;
+    } catch (e) {
+      alert(String(e));
+    }
+  });
+  btnOut?.addEventListener("click", async () => {
+    try {
+      const sel = await openDialog({ directory: true, multiple: false });
+      if (sel && typeof sel === "string") out.value = sel;
+    } catch (e) {
+      alert(String(e));
+    }
+  });
+
+  btnDef?.addEventListener("click", async () => {
+    try {
+      await fillDefaults();
+    } catch (e) {
+      alert(String(e));
+    }
+  });
+
+  function appendLine(text) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent = (logEl.textContent ? `${logEl.textContent}\n` : "") + `[${t}] ${text}`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  btnStart.addEventListener("click", async () => {
+    if (running) return;
+    const inputDir = inp.value.trim();
+    const outputDir = out.value.trim();
+    if (!inputDir || !outputDir) {
+      alert("请先选择输入与输出文件夹，或点击「填入默认路径」。");
+      return;
+    }
+    running = true;
+    btnStart.disabled = true;
+    if (btnDef) btnDef.disabled = true;
+    phase.textContent = "准备中…";
+    frac.textContent = "0 / 0";
+    bar.style.width = "0%";
+    bar.classList.remove("is-error");
+    logEl.textContent = "";
+    summary.textContent = "";
+
+    const listen = window.__TAURI__?.event?.listen;
+    let unlisten = null;
+    try {
+      if (typeof listen === "function") {
+        unlisten = await listen("word-to-pdf-progress", (ev) => {
+          const p = ev?.payload != null ? ev.payload : ev;
+          const t = p?.type;
+          const total = Number(p?.total || 0);
+          const idx = Number(p?.index || 0);
+          const name = p?.name || "";
+          const pct = total > 0 ? Math.min(100, Math.round((idx / total) * 100)) : 0;
+          if (t === "skip" || t === "convert" || t === "ok" || t === "fail") {
+            frac.textContent = `${idx} / ${total}`;
+            bar.style.width = `${pct}%`;
+          }
+          if (t === "convert") {
+            phase.textContent = "正在转换";
+            appendLine(`转换：${name}`);
+          } else if (t === "skip") {
+            phase.textContent = "跳过（已存在）";
+            appendLine(`跳过：${name}`);
+          } else if (t === "ok") {
+            phase.textContent = "进行中";
+            appendLine(`完成：${name}`);
+          } else if (t === "fail") {
+            phase.textContent = "有失败项";
+            bar.classList.add("is-error");
+            appendLine(`失败：${name} — ${p?.error || ""}`);
+          } else if (t === "done") {
+            phase.textContent = "批次结束";
+          }
+        });
+      } else {
+        appendLine("（未检测到进度事件 API，仅显示最终结果）");
+      }
+
+      const sum = await invoke("word_to_pdf_convert", { inputDir, outputDir });
+      summary.textContent = `转换 ${sum.converted} 个，跳过 ${sum.skipped} 个，失败 ${sum.failed} 个。输出目录：${sum.outputDir || outputDir}`;
+      phase.textContent = "完成";
+    } catch (e) {
+      alert(String(e));
+      phase.textContent = "出错";
+      appendLine(String(e));
+    } finally {
+      running = false;
+      btnStart.disabled = false;
+      if (btnDef) btnDef.disabled = false;
+      if (typeof unlisten === "function") unlisten();
+    }
   });
 }
 
@@ -1227,6 +1352,7 @@ btnClear.addEventListener("click", () => {
 
 setupNav();
 bindQuickActions();
+bindWord2Pdf();
 if (invokeFn) {
   window.appLog = appLog;
   invoke("get_app_log_path")

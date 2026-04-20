@@ -11,8 +11,10 @@ mod llm;
 mod schema;
 mod storage;
 mod validate;
+mod word_pdf;
 
 use crate::errors::AppError;
+use std::path::PathBuf;
 use crate::llm::LlmSettings;
 use crate::schema::{AppSettings, JdRecord, JdScoreResult, ParsedJdScoreRecord, ParsedResultRecord, ResumeData, ResumeRecord};
 
@@ -147,6 +149,31 @@ fn get_app_log_path() -> Result<String, AppError> {
     .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Word → PDF（Windows + 本机 Microsoft Word，PowerShell COM）
+#[tauri::command]
+async fn word_to_pdf_convert(
+  app: tauri::AppHandle,
+  input_dir: String,
+  output_dir: String,
+) -> Result<word_pdf::WordToPdfSummary, AppError> {
+  let input = PathBuf::from(input_dir);
+  let output = PathBuf::from(output_dir);
+  let app2 = app.clone();
+  tauri::async_runtime::spawn_blocking(move || word_pdf::run_word_to_pdf_batch(&app2, &input, &output))
+    .await
+    .map_err(|e| AppError::msg(e.to_string()))?
+}
+
+#[tauri::command]
+fn word_to_pdf_default_dirs() -> Result<(String, String), AppError> {
+  let root = storage::project_root_dir()?;
+  let (a, b) = word_pdf::default_input_output(&root);
+  Ok((
+    a.to_string_lossy().into_owned(),
+    b.to_string_lossy().into_owned(),
+  ))
+}
+
 fn main() {
   env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("resume_manager=info"))
     .format_timestamp_millis()
@@ -171,7 +198,9 @@ fn main() {
       load_app_settings,
       save_parsed_result_json,
       append_app_log,
-      get_app_log_path
+      get_app_log_path,
+      word_to_pdf_convert,
+      word_to_pdf_default_dirs
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

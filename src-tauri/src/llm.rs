@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 /// 与 `run_ollama_json` 中 Ollama `num_ctx` 保持一致，便于日志对照
 const RESUME_PARSE_NUM_CTX: u32 = 12000;
 
+/// 构建时嵌入仓库根目录的 `解析结果模板.json`；运行时同目录若存在同名文件则优先读取。
+const EMBEDDED_RESUME_TEMPLATE_JSON: &str =
+  include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../解析结果模板.json"));
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSettings {
   pub llama_cli_path: String,
@@ -43,14 +47,7 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
     settings.temperature
   );
 
-  let tpl_path = resolve_template_path("解析结果模板.json")?;
-  let tpl_content = std::fs::read_to_string(&tpl_path).map_err(|e| {
-    AppError::msg(format!(
-      "读取模板文件失败：{}。请确认文件存在且可读：{}",
-      e,
-      tpl_path.display()
-    ))
-  })?;
+  let tpl_content = load_resume_template_content()?;
   let tpl_for_prompt = template_for_prompt(&tpl_content);
 
   // 第一阶段：先抽取稳定结构（公司/职位/时间段/项目名称等骨架信息）
@@ -814,4 +811,38 @@ fn resolve_template_path(file_name: &str) -> Result<PathBuf, AppError> {
   }
 
   Err(AppError::msg(format!("无法定位模板文件：{}", file_name)))
+}
+
+fn load_resume_template_content() -> Result<String, AppError> {
+  let path = match resolve_template_path("解析结果模板.json") {
+    Ok(p) => p,
+    Err(e) => {
+      resume_parse_log!(
+        debug,
+        "resume_parse: 模板路径不可用，使用内置模板 err={}",
+        e
+      );
+      return Ok(EMBEDDED_RESUME_TEMPLATE_JSON.to_string());
+    }
+  };
+  if path.exists() {
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+      AppError::msg(format!(
+        "读取模板文件失败：{}。路径：{}",
+        e,
+        path.display()
+      ))
+    })?;
+    resume_parse_log!(
+      debug,
+      "resume_parse: 使用外部解析结果模板 path={}",
+      path.display()
+    );
+    return Ok(content);
+  }
+  resume_parse_log!(
+    debug,
+    "resume_parse: 未找到外部解析结果模板，使用内置模板"
+  );
+  Ok(EMBEDDED_RESUME_TEMPLATE_JSON.to_string())
 }

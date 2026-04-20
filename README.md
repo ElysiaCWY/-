@@ -40,7 +40,7 @@
 - `ui/main.js`：前端交互与 Tauri 命令调用
 - `ui/style.css`：界面样式
 - `start.ps1` / `start.bat`：Windows 一键启动脚本
-- `解析结果模板.json`：结构化输出字段模板（含 `basicInfo.contact` 等）
+- `解析结果模板.json`：结构化输出字段模板（含 `basicInfo.contact` 等）；构建时会 **嵌入程序**，分发绿色包可不附带；若与 exe 同目录放置同名文件则 **覆盖内置模板**
 
 ## 功能说明
 
@@ -194,6 +194,54 @@
 也可手动执行：
 
 - `npm run tauri:dev`
+
+## 打包与分发给他人（绿色使用）
+
+目标：对方 **不需要** 安装 Node.js、Rust 或克隆本仓库，解压（或安装）后即可使用。
+
+### 发布方：如何构建
+
+在项目根目录执行（需已安装 Node 与 Rust，仅构建机需要）：
+
+```bash
+npm install
+npm run tauri build
+```
+
+构建成功后：
+
+- 可执行文件一般在 `src-tauri/target/release/resume-manager.exe`
+- 若生成安装包，还会在 `src-tauri/target/release/bundle/` 下出现 NSIS / MSI 等（可按需选用「安装版」分发）
+
+### 对方机器上的前置条件
+
+- **Windows 10/11**（与当前打包目标一致）
+- **Ollama**：本应用解析与 JD 结构化依赖本地大模型，对方需自行安装 [Ollama](https://ollama.com/)，并 `pull` 你在 `app-config.json` 里配置的模型（例如 `qwen2.5:3b`）。应用无法把模型打进安装包，这一点与「完全离线单文件」不同，需提前说明。
+
+### 建议随程序一并提供的文件（最小绿色包）
+
+将下面内容放在 **同一文件夹**（或与 `resume-manager.exe` 的父级目录匹配程序查找逻辑，见下），再打成 zip 发给对方即可：
+
+| 文件 | 说明 |
+|------|------|
+| `resume-manager.exe` | 构建产物 |
+| `app-config.json` | 必填；可预填 `llamaCliPath`（默认 `http://127.0.0.1:11434`）与 `modelPath`，对方按需修改 |
+| `解析结果模板.json` | **可选**；未提供时使用 **内置模板**（与仓库中该文件一致）。仅当需要自定义字段说明或改模板时再放在 exe 同目录 |
+
+程序会通过 **`app-config.json` 所在目录** 作为「项目根」，自动创建 `data/`、`parsed-results/`、`logs/` 等，无需手工建目录。
+
+**说明**：简历库与 JD 列表仍保存在系统目录 `%LOCALAPPDATA%/resume-manager/`，与是否绿色包无关；解析结果库与归档 JSON 在项目根下。
+
+### 标准简历 PDF（可选）
+
+- **无 Node 环境**：导出 PDF 时会使用内置纯文本排版（`printpdf`），一般可直接生成；中文显示依赖对方系统已安装常见中文字体。
+- **JSON Resume 主题版（排版更接近网页模板）**：程序已 **内置** `jsonresume-theme-local`（与仓库一致）。当「项目根」下已执行过 `npm install`（存在 `node_modules/.bin/resume` 或 `resume.cmd`）且本地 **尚未** 自带主题目录时，首次导出 PDF 会自动在项目根 **释放** 内置主题；若你自行放置或修改了 `jsonresume-theme-local/`，则 **不会覆盖**。仍须本地 `resume-cli`（及 Puppeteer 等依赖）才能走该路径；若未满足，程序会自动回退到上文纯文本 PDF。
+
+### 对方怎么用
+
+1. 解压到你的文件夹，确认同目录有 `app-config.json`（模板已内置，一般无需再带 `解析结果模板.json`）
+2. 安装并启动 Ollama，拉取配置中的模型
+3. 双击 `resume-manager.exe`
 
 ## 使用流程（建议）
 

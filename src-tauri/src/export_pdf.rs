@@ -1,4 +1,5 @@
 use crate::errors::AppError;
+use crate::schema::{ProjectItem, ResumeData, WorkItem};
 use printpdf::ops::PdfFontHandle;
 use printpdf::{Mm, Op, ParsedFont, PdfDocument, PdfPage, PdfSaveOptions, Point, Pt, TextItem};
 use regex::Regex;
@@ -303,6 +304,149 @@ fn font_size_for(kind: LineKind) -> f32 {
     LineKind::Divider => 9.0,
     LineKind::Normal => 11.0,
   }
+}
+
+fn inline_clean(s: &str) -> String {
+  s.replace('\r', "").trim().to_string()
+}
+
+fn dash_or(s: &str) -> String {
+  let t = inline_clean(s);
+  if t.is_empty() {
+    "-".to_string()
+  } else {
+    t
+  }
+}
+
+fn sort_map_keys_numeric(keys: impl Iterator<Item = std::string::String>) -> Vec<std::string::String> {
+  let mut v: Vec<_> = keys.collect();
+  v.sort_by_key(|k| k.parse::<usize>().unwrap_or(9999));
+  v
+}
+
+/// 与前端 `buildTemplateBlock` 对齐的 Markdown 风格纯文本，供无 Node 时使用 `write_resume_pdf` 生成 PDF。
+pub fn resume_data_to_plain_pdf_content(resume: &ResumeData, include_skills: bool) -> String {
+  let b = &resume.basic_info;
+  let mut lines: Vec<String> = Vec::new();
+  let name = inline_clean(&b.name);
+  lines.push(format!(
+    "# {}",
+    if name.is_empty() {
+      "候选人姓名"
+    } else {
+      name.as_str()
+    }
+  ));
+  lines.push("## 基础信息".to_string());
+  lines.push(format!("- 性别：{}", dash_or(&b.gender)));
+  lines.push(format!("- 年龄：{}", dash_or(&b.age)));
+  lines.push(format!("- 联系方式：{}", dash_or(&b.contact)));
+
+  let edu: Vec<_> = b
+    .education
+    .iter()
+    .filter(|e| {
+      !inline_clean(&e.school).is_empty()
+        || !inline_clean(&e.degree).is_empty()
+        || !inline_clean(&e.major).is_empty()
+        || !inline_clean(&e.period).is_empty()
+    })
+    .collect();
+  if !edu.is_empty() {
+    lines.push("## 教育背景".to_string());
+    for e in edu {
+      lines.push(format!(
+        "- {} / {} / {} / {}",
+        dash_or(&e.school),
+        dash_or(&e.degree),
+        dash_or(&e.major),
+        dash_or(&e.period)
+      ));
+    }
+  }
+
+  if include_skills && !b.skills.is_empty() {
+    let s = b
+      .skills
+      .iter()
+      .map(|x| inline_clean(x))
+      .filter(|x| !x.is_empty())
+      .collect::<Vec<_>>()
+      .join(" / ");
+    if !s.is_empty() {
+      lines.push("## 技能".to_string());
+      lines.push(format!("- {}", s));
+    }
+  }
+
+  if !b.certificates.is_empty() {
+    let c = b
+      .certificates
+      .iter()
+      .map(|x| inline_clean(x))
+      .filter(|x| !x.is_empty())
+      .collect::<Vec<_>>()
+      .join(" / ");
+    if !c.is_empty() {
+      lines.push("## 证书".to_string());
+      lines.push(format!("- {}", c));
+    }
+  }
+
+  let w_keys = sort_map_keys_numeric(resume.work_experience.keys().cloned());
+  let work_rows: Vec<&WorkItem> = w_keys
+    .iter()
+    .filter_map(|k| resume.work_experience.get(k))
+    .filter(|w| {
+      !inline_clean(&w.company).is_empty()
+        || !inline_clean(&w.position).is_empty()
+        || !inline_clean(&w.period).is_empty()
+        || !inline_clean(&w.description).is_empty()
+    })
+    .collect();
+  if !work_rows.is_empty() {
+    lines.push("## 工作经历".to_string());
+    for w in work_rows {
+      lines.push(format!(
+        "- {} / {} / {}",
+        dash_or(&w.company),
+        dash_or(&w.position),
+        dash_or(&w.period)
+      ));
+      let d = inline_clean(&w.description);
+      if !d.is_empty() {
+        lines.push(format!("  - {}", d));
+      }
+    }
+  }
+
+  let p_keys = sort_map_keys_numeric(resume.project_experience.keys().cloned());
+  let proj_rows: Vec<&ProjectItem> = p_keys
+    .iter()
+    .filter_map(|k| resume.project_experience.get(k))
+    .filter(|p| {
+      !inline_clean(&p.project_name).is_empty()
+        || !inline_clean(&p.project_description).is_empty()
+        || !inline_clean(&p.project_achievements).is_empty()
+    })
+    .collect();
+  if !proj_rows.is_empty() {
+    lines.push("## 项目经历".to_string());
+    for p in proj_rows {
+      lines.push(format!(
+        "- {}：{}",
+        dash_or(&p.project_name),
+        dash_or(&p.project_description)
+      ));
+      let a = inline_clean(&p.project_achievements);
+      if !a.is_empty() {
+        lines.push(format!("  - 成果：{}", a));
+      }
+    }
+  }
+
+  lines.join("\n")
 }
 
 pub fn write_resume_pdf(content: &str, out_path: &str) -> Result<(), AppError> {

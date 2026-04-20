@@ -19,6 +19,10 @@ app-config.json
 data/
 parsed-results/
 
+# Local bulk conversion samples (optional; do not commit)
+test/pdf/
+test/word/
+
 # OS/editor
 .DS_Store
 Thumbs.db

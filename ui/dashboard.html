@@ -18,6 +18,7 @@
           <a class="nav-item active" data-page="dashboard" href="#dashboard">首页概览</a>
           <a class="nav-item" data-page="library" href="#library">简历库</a>
           <a class="nav-item" data-page="parse" href="#parse">导入与解析</a>
+          <a class="nav-item" data-page="word2pdf" href="#word2pdf">Word 转 PDF</a>
           <a class="nav-item" data-page="jd" href="#jd">JD 管理筛选</a>
         </nav>
       </aside>
@@ -92,6 +93,49 @@
                 <tr><td colspan="3" class="muted">暂无任务</td></tr>
               </tbody>
             </table>
+          </section>
+        </section>
+
+        <section class="page" data-page="word2pdf">
+          <section class="card">
+            <h2>Word 批量转 PDF</h2>
+            <p class="subtext">
+              需本机安装 <strong>Microsoft Word</strong>（桌面版）。支持 <code>.doc</code>、<code>.docx</code>；若目标 PDF 已存在则跳过。默认路径与旧脚本一致：<code>test/word</code> → <code>test/pdf</code>（相对项目根，即 <code>app-config.json</code> 所在目录）。
+            </p>
+            <div class="row" style="align-items: flex-start; flex-wrap: wrap; gap: 12px">
+              <div style="flex: 1; min-width: 240px">
+                <div class="muted" style="font-size: 12px; margin-bottom: 4px">输入文件夹（Word）</div>
+                <div class="row">
+                  <input id="word2pdfInputDir" type="text" readonly placeholder="选择目录…" class="mono" style="flex: 1" />
+                  <button id="word2pdfBrowseIn" type="button">浏览</button>
+                </div>
+              </div>
+              <div style="flex: 1; min-width: 240px">
+                <div class="muted" style="font-size: 12px; margin-bottom: 4px">输出文件夹（PDF）</div>
+                <div class="row">
+                  <input id="word2pdfOutputDir" type="text" readonly placeholder="选择目录…" class="mono" style="flex: 1" />
+                  <button id="word2pdfBrowseOut" type="button">浏览</button>
+                </div>
+              </div>
+            </div>
+            <div class="row" style="margin-top: 12px">
+              <button id="word2pdfStart" class="primary" type="button">开始转换</button>
+              <button id="word2pdfDefaults" type="button" class="ghost">填入默认路径</button>
+            </div>
+          </section>
+          <section class="card">
+            <h2>进度</h2>
+            <div class="queue-progress-wrap">
+              <div class="queue-progress-meta">
+                <span id="word2pdfPhase" class="muted">空闲</span>
+                <span id="word2pdfFraction" class="mono">0 / 0</span>
+              </div>
+              <div class="queue-progress-track">
+                <div id="word2pdfBar" class="queue-progress-fill" style="width: 0%"></div>
+              </div>
+            </div>
+            <pre id="word2pdfLog" class="pre" style="min-height: 120px; max-height: 280px; margin-top: 10px"></pre>
+            <p id="word2pdfSummary" class="small subtext" style="margin-top: 8px"></p>
           </section>
         </section>
 
