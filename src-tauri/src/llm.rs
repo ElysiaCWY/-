@@ -5,9 +5,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 /// 与 `run_ollama_json` 中 Ollama `num_ctx` 保持一致，便于日志对照
-const RESUME_PARSE_NUM_CTX: u32 = 12000;
+const RESUME_PARSE_NUM_CTX: u32 = 65536;
+/// 单次 Ollama 请求最大等待时长（秒），避免任务无限挂起。
+const OLLAMA_REQUEST_TIMEOUT_SECS: u64 = 180;
+/// 单次生成最大 token 数，避免使用默认较小上限导致 JSON 被截断。
+const OLLAMA_NUM_PREDICT: i32 = 8192;
+/// 单阶段（stage1/stage2）最大尝试次数：首次 + 重试。
+const OLLAMA_MAX_ATTEMPTS: usize = 2;
+/// 重试前等待毫秒。
+const OLLAMA_RETRY_DELAY_MS: u64 = 1200;
 
 /// 构建时嵌入仓库根目录的 `解析结果模板.json`；运行时同目录若存在同名文件则优先读取。
 const EMBEDDED_RESUME_TEMPLATE_JSON: &str =
@@ -157,6 +167,7 @@ fn build_stage1_prompt(tpl: &str, text: &str) -> String {
 4. 项目经历必须尽可能完整抽取（来自“项目经历/项目经验/项目描述”等章节），不要遗漏条目。
 5. 严禁混入其他候选人的信息；若原文无证据，不得编造。
 6. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+7. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
 
 简历内容：
 """{text}""""#,
@@ -185,6 +196,7 @@ fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
 3. projectExperience 的条目数量不得少于第一阶段，不能因为补全而删减已有项目。
 4. 严禁混入其他候选人的信息；只有简历原文可找到依据的经历才能保留。
 5. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+6. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
 
 简历内容：
 """{text}""""#,
@@ -207,71 +219,157 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
       "temperature": settings.temperature,
       "num_ctx": RESUME_PARSE_NUM_CTX,
       "num_thread": settings.threads,
+      "num_predict": OLLAMA_NUM_PREDICT,
     }
   });
 
   resume_parse_log!(
     debug,
-    "resume_parse: [{}] POST {} prompt_chars={}",
+    "resume_parse: [{}] POST {} prompt_chars={} timeout_s={} max_attempts={} num_predict={}",
     label,
     endpoint,
-    prompt.chars().count()
+    prompt.chars().count(),
+    OLLAMA_REQUEST_TIMEOUT_SECS,
+    OLLAMA_MAX_ATTEMPTS,
+    OLLAMA_NUM_PREDICT
   );
 
-  let resp = ureq::post(&endpoint)
-    .set("Content-Type", "application/json")
-    .send_json(body)
-    .map_err(|e| {
-      resume_parse_log!(
-        error,
-        "resume_parse: [{}] HTTP 请求失败 {} err={}",
-        label,
-        base_url,
-        e
-      );
-      AppError::msg(format!(
-        "调用 Ollama 失败：{}。请确认 Ollama 已启动（ollama serve）且地址可访问：{}",
-        e, base_url
-      ))
-    })?;
+  let mut last_err: Option<String> = None;
+  for attempt in 1..=OLLAMA_MAX_ATTEMPTS {
+    let result = ureq::post(&endpoint)
+      .set("Content-Type", "application/json")
+      .timeout(Duration::from_secs(OLLAMA_REQUEST_TIMEOUT_SECS))
+      .send_json(body.clone());
 
-  let payload: Value = resp
-    .into_json()
-    .map_err(|e| {
-      resume_parse_log!(
-        error,
-        "resume_parse: [{}] 解析 Ollama JSON 响应失败: {}",
-        label,
-        e
-      );
-      AppError::msg(format!("解析 Ollama 响应失败：{}", e))
-    })?;
+    let resp = match result {
+      Ok(resp) => resp,
+      Err(e) => {
+        let err_text = e.to_string();
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "resume_parse: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            base_url,
+            err_text,
+            OLLAMA_RETRY_DELAY_MS
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "resume_parse: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
+          label,
+          attempt,
+          OLLAMA_MAX_ATTEMPTS,
+          base_url,
+          err_text
+        );
+        return Err(AppError::msg(format!(
+          "调用 Ollama 失败（阶段：{}，已重试 {} 次）：{}。请确认 Ollama 可访问：{}；若偶发卡住，建议重试本批次。",
+          label,
+          OLLAMA_MAX_ATTEMPTS,
+          err_text,
+          base_url
+        )));
+      }
+    };
 
-  let raw_text = payload
-    .get("response")
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| {
-      resume_parse_log!(
-        error,
-        "resume_parse: [{}] 响应缺少 response 字段 payload={}",
-        label,
-        payload
-      );
-      AppError::msg(format!("Ollama 响应缺少 response 字段：{}", payload))
-    })?;
+    let payload: Value = resp
+      .into_json()
+      .map_err(|e| {
+        resume_parse_log!(
+          error,
+          "resume_parse: [{}] 解析 Ollama JSON 响应失败: {}",
+          label,
+          e
+        );
+        AppError::msg(format!("解析 Ollama 响应失败：{}", e))
+      })?;
 
-  extract_json_object(raw_text).ok_or_else(|| {
-    resume_parse_log!(
-      error,
-      "resume_parse: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
-      label,
-      clip(raw_text, 800)
-    );
-    AppError::msg(format!(
-      "模型输出中未找到 JSON 对象。原始输出前800字符：{}",
-      clip(raw_text, 800)
-    ))
-  })
+    let raw_text = payload
+      .get("response")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| {
+        resume_parse_log!(
+          error,
+          "resume_parse: [{}] 响应缺少 response 字段 payload={}",
+          label,
+          payload
+        );
+        AppError::msg(format!("Ollama 响应缺少 response 字段：{}", payload))
+      })?;
+
+    let extracted = match extract_json_object(raw_text) {
+      Some(v) => v,
+      None => {
+        let err_text = format!("模型输出中未找到 JSON 对象。原始输出前800字符：{}", clip(raw_text, 800));
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "resume_parse: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 raw_prefix={}",
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            OLLAMA_RETRY_DELAY_MS,
+            clip(raw_text, 400)
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "resume_parse: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
+          label,
+          clip(raw_text, 800)
+        );
+        return Err(AppError::msg(err_text));
+      }
+    };
+
+    match serde_json::from_str::<Value>(&extracted) {
+      Ok(_) => return Ok(extracted),
+      Err(e) => {
+        let err_text = format!("模型输出 JSON 语法错误：{}", e);
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "resume_parse: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            e,
+            OLLAMA_RETRY_DELAY_MS,
+            clip(&extracted, 400)
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "resume_parse: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
+          label,
+          attempt,
+          OLLAMA_MAX_ATTEMPTS,
+          e,
+          clip(&extracted, 800)
+        );
+        return Err(AppError::msg(format!("{}。原始输出前800字符：{}", err_text, clip(&extracted, 800))));
+      }
+    }
+  }
+
+  Err(AppError::msg(format!(
+    "调用 Ollama 失败（阶段：{}）：{}",
+    label,
+    last_err.unwrap_or_else(|| "未知错误".to_string())
+  )))
 }
 
 fn normalize_ollama_base_url(input: &str) -> String {

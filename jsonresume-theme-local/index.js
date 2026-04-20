@@ -74,6 +74,7 @@ module.exports = {
     const contact = [basics.phone, basics.email].map((x) => clean(x)).filter(Boolean).join(" / ");
     const baseInfo = [
       row("性别", basics.xGender || ""),
+      row("年龄", basics.xAge || ""),
       row("联系方式", contact || basics.phone || basics.email || ""),
     ].join("");
 

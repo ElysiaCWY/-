@@ -94,6 +94,7 @@ pub fn resume_data_to_json_resume(resume: &ResumeData, include_skills: bool) -> 
       "name": safe(&b.name),
       "label": "",
       "xGender": safe(&b.gender),
+      "xAge": safe(&b.age),
       "image": "",
       "email": "",
       "phone": safe(&b.contact),
