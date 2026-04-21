@@ -1,8 +1,9 @@
 use crate::errors::AppError;
 use crate::jd::{JdStructuredRequirement, ResumeStructuredForScore};
+use crate::llm::{complete_json_prompt, JsonPromptParams, LlmSettings};
 use crate::schema::{AppSettings, JdRecord, ParsedJdScoreRecord, ParsedResultRecord, ResumeData, ResumeRecord};
 use rusqlite::{params, Connection};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -306,7 +307,8 @@ fn unique_json_path(base_dir: &Path, base_name: &str) -> PathBuf {
   base_dir.join(format!("{}_{}.json", base_name, now_epoch()))
 }
 
-fn classify_position_folder(root_dir: &Path, data: &ResumeData, position: &str) -> String {
+/// 按解析得到的主岗位名作为子目录名；若已有相似目录则复用，避免重复建「后端开发 / 后端 开发」等。
+fn classify_position_folder(root_dir: &Path, position: &str) -> String {
   let normalized = position
     .split_whitespace()
     .collect::<Vec<_>>()
@@ -319,50 +321,10 @@ fn classify_position_folder(root_dir: &Path, data: &ResumeData, position: &str) 
   }
 
   let existing = list_existing_position_folders(root_dir);
-  let summary = build_resume_summary_for_folder(data, &normalized);
-
-  // 让 AI 判断归并目录（优先归并到已有目录，必要时新建目录）。
-  if let Some(ai_folder) = ai_select_position_folder(&summary, &existing) {
-    if let Some(found) = find_similar_existing_folder(&existing, &ai_folder) {
-      return found;
-    }
-    return ai_folder;
-  }
-
-  // AI 不可用时，仅回退为岗位名目录，不再做规则化硬编码分类。
   if let Some(found) = find_similar_existing_folder(&existing, &normalized) {
     return found;
   }
   normalized
-}
-
-fn build_resume_summary_for_folder(data: &ResumeData, position: &str) -> String {
-  let mut skills = data
-    .basic_info
-    .skills
-    .iter()
-    .map(|s| s.trim())
-    .filter(|s| !s.is_empty())
-    .take(10)
-    .collect::<Vec<_>>();
-
-  if skills.is_empty() {
-    skills.push("(无)");
-  }
-
-  let latest_company = data
-    .work_experience
-    .get("1")
-    .map(|w| w.company.trim())
-    .filter(|s| !s.is_empty())
-    .unwrap_or("(无)");
-
-  format!(
-    "岗位：{}\n最近公司：{}\n技能：{}",
-    position,
-    latest_company,
-    skills.join("、")
-  )
 }
 
 fn list_existing_position_folders(root_dir: &Path) -> Vec<String> {
@@ -415,76 +377,6 @@ fn find_similar_existing_folder(existing: &[String], target: &str) -> Option<Str
   }
 
   None
-}
-
-fn normalize_ollama_base_url(input: &str) -> String {
-  let raw = input.trim();
-  if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
-    return "http://127.0.0.1:11434".to_string();
-  }
-
-  if raw.starts_with("http://") || raw.starts_with("https://") {
-    return raw.trim_end_matches('/').to_string();
-  }
-
-  format!("http://{}", raw.trim_end_matches('/'))
-}
-
-fn extract_json_object(s: &str) -> Option<String> {
-  let t = s.trim();
-  let start = t.find('{')?;
-  let end = t.rfind('}')?;
-  if end <= start {
-    return None;
-  }
-  Some(t[start..=end].to_string())
-}
-
-fn ai_select_position_folder(summary: &str, existing: &[String]) -> Option<String> {
-  let settings = load_settings().ok()?;
-  if settings.model_path.trim().is_empty() {
-    return None;
-  }
-
-  let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
-  let endpoint = format!("{}/api/generate", base_url);
-  let existing_text = if existing.is_empty() {
-    "（无已有目录）".to_string()
-  } else {
-    existing.join(" | ")
-  };
-
-  let prompt = format!(
-    "你是岗位目录归并助手。\n已有目录：{existing_text}\n简历摘要：\n{summary}\n"
-  ) +
-  "规则：\n1. 若与已有目录语义相近，必须直接复用已有目录名。\n2. 仅在确实无法归并时，新建简短目录名（2-12字）。\n3. 不要输出级别、年限、公司名。\n4. 仅返回 JSON：{\"folder\":\"目录名\"}，不要解释。";
-
-  let body = json!({
-    "model": settings.model_path.trim(),
-    "prompt": prompt,
-    "format": "json",
-    "stream": false,
-    "options": {
-      "temperature": 0.0,
-      "num_ctx": 1024,
-      "num_thread": settings.threads,
-    }
-  });
-
-  let resp = ureq::post(&endpoint)
-    .set("Content-Type", "application/json")
-    .send_json(body)
-    .ok()?;
-
-  let payload: Value = resp.into_json().ok()?;
-  let raw_text = payload.get("response")?.as_str()?;
-  let raw_json = extract_json_object(raw_text)?;
-  let v: Value = serde_json::from_str(&raw_json).ok()?;
-  let folder = v.get("folder")?.as_str()?.trim();
-  if folder.is_empty() {
-    return None;
-  }
-  Some(folder.to_string())
 }
 
 pub fn list_resumes() -> Result<Vec<ResumeRecord>, AppError> {
@@ -859,7 +751,7 @@ pub fn save_parsed_result_json(source_file: String, resume_id: String, data: Res
   let degree = extract_top_degree(&data);
   let work_years = calc_work_years(&data);
   let skills = extract_skills(&data);
-  let folder_name = classify_position_folder(&root_dir, &data, &position);
+  let folder_name = classify_position_folder(&root_dir, &position);
   let dir = root_dir.join(sanitize_filename(&folder_name));
   if !dir.exists() {
     fs::create_dir_all(&dir)?;
@@ -1020,8 +912,6 @@ fn clamp_limit(limit: i32) -> usize {
 }
 
 fn ai_extract_jd_requirements(position: &str, jd_text: &str, settings: &AppSettings) -> Result<JdStructuredRequirement, AppError> {
-  let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
-  let endpoint = format!("{}/api/generate", base_url);
   let prompt = format!(
     "你是 JD 结构化提取助手。请根据岗位名和JD，提取筛选所需结构化要求。\n"
   ) +
@@ -1033,30 +923,18 @@ fn ai_extract_jd_requirements(position: &str, jd_text: &str, settings: &AppSetti
   + "\nJD：\n"
   + jd_text;
 
-  let body = json!({
-    "model": settings.model_path.trim(),
-    "prompt": prompt,
-    "format": "json",
-    "stream": false,
-    "options": {
-      "temperature": 0.0,
-      "num_ctx": 4096,
-      "num_thread": settings.threads,
-    }
-  });
-
-  let resp = ureq::post(&endpoint)
-    .set("Content-Type", "application/json")
-    .send_json(body)
-    .map_err(|e| AppError::msg(format!("提取 JD 结构化要求失败：{}", e)))?;
-  let payload: Value = resp
-    .into_json()
-    .map_err(|e| AppError::msg(format!("解析 JD 结构化响应失败：{}", e)))?;
-  let raw = payload
-    .get("response")
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| AppError::msg("JD 结构化响应缺少 response"))?;
-  let json_text = extract_json_object(raw).ok_or_else(|| AppError::msg("JD 结构化响应不是合法 JSON"))?;
+  let llm = LlmSettings::from(settings);
+  let json_text = complete_json_prompt(
+    "jd_structured",
+    &prompt,
+    &llm,
+    JsonPromptParams {
+      temperature: 0.0,
+      ollama_num_ctx: 4096,
+      ollama_num_predict: None,
+    },
+  )
+  .map_err(|e| AppError::msg(format!("提取 JD 结构化要求失败：{}", e)))?;
   let mut req: JdStructuredRequirement = serde_json::from_str(&json_text)
     .map_err(|e| AppError::msg(format!("JD 结构化 JSON 反序列化失败：{}", e)))?;
 
@@ -1192,9 +1070,6 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
 }
 
 fn ai_score_resume_match(resume: &ResumeData, jd_text: &str, settings: &AppSettings) -> Result<(i32, Vec<String>, usize), AppError> {
-  let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
-  let endpoint = format!("{}/api/generate", base_url);
-
   let resume_json = serde_json::to_string(resume)
     .map_err(|e| AppError::msg(format!("序列化简历失败：{}", e)))?;
 
@@ -1206,31 +1081,18 @@ fn ai_score_resume_match(resume: &ResumeData, jd_text: &str, settings: &AppSetti
   + &format!("JD:\n{}\n", jd_text)
   + &format!("简历(JSON):\n{}\n", resume_json);
 
-  let body = json!({
-    "model": settings.model_path.trim(),
-    "prompt": prompt,
-    "format": "json",
-    "stream": false,
-    "options": {
-      "temperature": 0.0,
-      "num_ctx": 4096,
-      "num_thread": settings.threads,
-    }
-  });
-
-  let resp = ureq::post(&endpoint)
-    .set("Content-Type", "application/json")
-    .send_json(body)
-    .map_err(|e| AppError::msg(format!("调用模型评分失败：{}", e)))?;
-
-  let payload: Value = resp
-    .into_json()
-    .map_err(|e| AppError::msg(format!("解析模型评分响应失败：{}", e)))?;
-  let raw = payload
-    .get("response")
-    .and_then(|v| v.as_str())
-    .ok_or_else(|| AppError::msg("模型评分响应缺少 response"))?;
-  let json_text = extract_json_object(raw).ok_or_else(|| AppError::msg("模型评分响应不是合法 JSON"))?;
+  let llm = LlmSettings::from(settings);
+  let json_text = complete_json_prompt(
+    "jd_model_score",
+    &prompt,
+    &llm,
+    JsonPromptParams {
+      temperature: 0.0,
+      ollama_num_ctx: 4096,
+      ollama_num_predict: None,
+    },
+  )
+  .map_err(|e| AppError::msg(format!("调用模型评分失败：{}", e)))?;
   let v: Value = serde_json::from_str(&json_text)
     .map_err(|e| AppError::msg(format!("模型评分 JSON 解析失败：{}", e)))?;
 

@@ -90,6 +90,7 @@ let appSettings = {
   model_path: "",
   threads: 4,
   temperature: 0.1,
+  llm_provider: "ollama",
 };
 
 const TITLE_MAP = {
@@ -378,6 +379,9 @@ async function loadSettingsFromFile() {
       model_path: (s.modelPath || "").trim(),
       threads: Number(s.threads ?? 4),
       temperature: Number(s.temperature ?? 0.1),
+      llm_provider: String(s.llmProvider || "ollama")
+        .trim()
+        .toLowerCase() || "ollama",
     };
   } catch (e) {
     appSettings = {
@@ -385,6 +389,7 @@ async function loadSettingsFromFile() {
       model_path: "",
       threads: 4,
       temperature: 0.1,
+      llm_provider: "ollama",
     };
     alert(`加载配置失败：${String(e)}\n请检查项目根目录 app-config.json`);
   }
@@ -1198,8 +1203,16 @@ bindImportTriggers();
 btnParse.addEventListener("click", async () => {
   try {
     setBusy(true);
-    if (!appSettings.llama_cli_path || !appSettings.model_path) {
-      alert("请先在项目根目录 app-config.json 中配置 llamaCliPath 和 modelPath");
+    const prov = (appSettings.llm_provider || "").toLowerCase();
+    const isLm = prov === "lmstudio" || prov === "lm-studio" || prov === "lm_studio";
+    const missingBase = !isLm && !appSettings.llama_cli_path.trim();
+    const missingModel = !appSettings.model_path.trim();
+    if (missingBase || missingModel) {
+      alert(
+        isLm
+          ? "请先在项目根目录 app-config.json 中配置 modelPath（LM Studio 下 llamaCliPath 可留空，默认 http://127.0.0.1:1234/v1）"
+          : "请先在项目根目录 app-config.json 中配置 llamaCliPath 和 modelPath"
+      );
       return;
     }
     const pending = importQueue.filter((x) => !x.error && x.text && x.status !== "已完成");

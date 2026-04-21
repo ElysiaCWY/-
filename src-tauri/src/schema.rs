@@ -139,6 +139,10 @@ pub struct JdScoreBreakdown {
   pub project_score: i32,
 }
 
+fn default_llm_provider() -> String {
+  "ollama".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -146,6 +150,9 @@ pub struct AppSettings {
   pub model_path: String,
   pub threads: i32,
   pub temperature: f32,
+  /// `ollama`（默认）或 `lmstudio`（OpenAI 兼容，如 LM Studio 本地服务）
+  #[serde(default = "default_llm_provider")]
+  pub llm_provider: String,
 }
 
 impl Default for AppSettings {
@@ -155,6 +162,7 @@ impl Default for AppSettings {
       model_path: String::new(),
       threads: 4,
       temperature: 0.0,
+      llm_provider: default_llm_provider(),
     }
   }
 }

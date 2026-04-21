@@ -13,7 +13,7 @@
 - 桌面框架：Tauri 1.x
 - 后端：Rust 2021
 - 前端：原生 HTML + CSS + JavaScript
-- 模型调用：Ollama 本地服务（默认 `http://127.0.0.1:11434`）
+- 模型调用：Ollama（默认 `http://127.0.0.1:11434`）或 LM Studio OpenAI 兼容接口（默认 `http://127.0.0.1:1234/v1`），由 `app-config.json` 的 `llmProvider` 选择
 
 关键依赖（后端）：
 
@@ -77,9 +77,10 @@
 
 设置项（见 `app-config.json`）：
 
-- `llamaCliPath`：Ollama 服务地址
-- `modelPath`：Ollama 模型名
-- `threads`：推理线程数
+- `llmProvider`：本地模型后端，`ollama`（默认）或 `lmstudio`（LM Studio 的 OpenAI 兼容接口）
+- `llamaCliPath`：Ollama 时为服务根地址（默认 `http://127.0.0.1:11434`）；LM Studio 时为 OpenAI 兼容根地址（可留空，默认 `http://127.0.0.1:1234/v1`）
+- `modelPath`：Ollama 时为模型名；LM Studio 时为当前已加载模型在 API 中使用的 **model id**（与 LM Studio 界面一致）
+- `threads`：推理线程数（Ollama 生效；LM Studio 由服务端/模型侧决定）
 - `temperature`：采样温度
 
 ### 3. 结果导出与落盘
@@ -93,9 +94,7 @@
 默认行为（推荐流程）：
 
 - 批量解析成功后，自动保存结构化 JSON 到本地固定目录
-- 按岗位做智能归并后归档到子文件夹：
-  - 由本地 AI 结合「已有目录 + 当前简历摘要」自动判断归并目录
-  - 语义接近岗位会复用已有目录；无法归并时自动创建新目录
+- 按**主岗位名**归档到 `parsed-results/` 下子文件夹；若已存在名称相近的目录则复用，否则新建以岗位名为名的目录
 - 自动写入解析结果索引 `parsed-results/parsed-index.json`，便于追踪来源文件与导入日期
 - **同步写入项目内 SQLite**（见下文「数据存储位置」），供 JD 筛选使用
 
@@ -146,8 +145,9 @@
 
 字段说明：
 
-- `llamaCliPath`：Ollama 服务地址（默认 `http://127.0.0.1:11434`）
-- `modelPath`：Ollama 模型名（例如 `qwen2.5:3b`）
+- `llmProvider`：可选，默认 `ollama`；设为 `lmstudio` 时使用 LM Studio 本地服务（`/v1/chat/completions`）
+- `llamaCliPath`：Ollama 服务地址（默认 `http://127.0.0.1:11434`）；LM Studio 可填 `http://127.0.0.1:1234/v1` 或留空（同上默认）
+- `modelPath`：Ollama 模型名（例如 `qwen2.5:3b`）；LM Studio 为所选模型的 API 名称
 - `threads`：推理线程数
 - `temperature`：采样温度
 

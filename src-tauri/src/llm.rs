@@ -1,5 +1,5 @@
 use crate::errors::AppError;
-use crate::schema::{ProjectItem, ResumeData, WorkItem};
+use crate::schema::{AppSettings, ProjectItem, ResumeData, WorkItem};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -23,34 +23,74 @@ const OLLAMA_RETRY_DELAY_MS: u64 = 1200;
 const EMBEDDED_RESUME_TEMPLATE_JSON: &str =
   include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../解析结果模板.json"));
 
+fn default_llm_provider() -> String {
+  "ollama".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmSettings {
   pub llama_cli_path: String,
   pub model_path: String,
   pub threads: i32,
   pub temperature: f32,
+  #[serde(default = "default_llm_provider", alias = "llmProvider")]
+  pub llm_provider: String,
+}
+
+impl From<&AppSettings> for LlmSettings {
+  fn from(s: &AppSettings) -> Self {
+    Self {
+      llama_cli_path: s.llama_cli_path.clone(),
+      model_path: s.model_path.clone(),
+      threads: s.threads,
+      temperature: s.temperature,
+      llm_provider: s.llm_provider.clone(),
+    }
+  }
+}
+
+/// 调用本地模型生成一段 JSON 文本（与简历解析阶段相同的重试与校验逻辑）。
+#[derive(Debug, Clone)]
+pub struct JsonPromptParams {
+  pub temperature: f32,
+  pub ollama_num_ctx: u32,
+  pub ollama_num_predict: Option<i32>,
+}
+
+fn provider_is_lmstudio(raw: &str) -> bool {
+  matches!(
+    raw.trim().to_ascii_lowercase().as_str(),
+    "lmstudio" | "lm-studio" | "lm_studio"
+  )
 }
 
 pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<ResumeData, AppError> {
   if settings.model_path.trim().is_empty() {
     resume_parse_log!(error, "resume_parse: 中止，未配置模型名");
-    return Err(AppError::msg("请在设置中填写 Ollama 模型名，例如 qwen2.5:3b"));
+    return Err(AppError::msg(
+      "请在 app-config.json 的 modelPath 中填写模型名（Ollama 如 qwen2.5:3b；LM Studio 与左侧已选模型 ID 一致）",
+    ));
   }
 
   if looks_like_gguf_path(&settings.model_path) {
     resume_parse_log!(error, "resume_parse: 中止，modelPath 不能为 .gguf 路径");
     return Err(AppError::msg(
-      "当前已切换为 Ollama 调用，modelPath 需要填写模型名（如 qwen2.5:3b），不再支持 .gguf 文件路径",
+      "modelPath 需要填写模型名（如 qwen2.5:3b），不再支持 .gguf 文件路径",
     ));
   }
 
-  let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
+  let base_log = if provider_is_lmstudio(&settings.llm_provider) {
+    normalize_lmstudio_base_url(&settings.llama_cli_path)
+  } else {
+    normalize_ollama_base_url(&settings.llama_cli_path)
+  };
   let text_chars = text.chars().count();
   resume_parse_log!(
     info,
-    "resume_parse: 开始 model={} ollama_base={} text_chars={} num_ctx={} threads={} temp={}",
+    "resume_parse: 开始 provider={} model={} base={} text_chars={} num_ctx={} threads={} temp={}",
+    settings.llm_provider.trim(),
     settings.model_path.trim(),
-    base_url,
+    base_log,
     text_chars,
     RESUME_PARSE_NUM_CTX,
     settings.threads,
@@ -139,6 +179,7 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
   // 防止第二阶段“补全”时把第一阶段已抽到的项目/工作经历条目变少。
   let final_data = preserve_project_items(&stage1_data, final_data);
   let final_data = preserve_work_items(&stage1_data, final_data);
+  let final_data = preserve_basic_and_details(&stage1_data, final_data);
 
   let grounded = filter_resume_by_source_text(final_data, text);
   resume_parse_log!(
@@ -164,10 +205,11 @@ fn build_stage1_prompt(tpl: &str, text: &str) -> String {
 1. 严格按模板字段输出，不要新增或删除字段。
 2. 工作经历与项目经历要尽量完整枚举，按时间倒序。
 3. 本阶段优先保证结构完整和分段正确，description/projectAchievements 可简写。
-4. 项目经历必须尽可能完整抽取（来自“项目经历/项目经验/项目描述”等章节），不要遗漏条目。
-5. 严禁混入其他候选人的信息；若原文无证据，不得编造。
-6. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
-7. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
+4. 项目经历必须尽可能完整抽取（来自“项目经历/项目经验/项目描述”等章节），不要遗漏条目。每条项目中：projectDescription 侧重背景、职责、技术方案与实现要点；**projectAchievements 必须承载简历里该项目的「项目业绩」「项目成果」「业绩」「效果/指标」等成果类表述**（含量化数据、获奖、业务效果）；若原文把业绩写在项目段落内或单独小标题下，须完整迁入 projectAchievements，勿仅堆在 projectDescription 而留空成果。
+5. basicInfo.skills：除简历中明确列出的技能（如「专业技能」「技术栈」「掌握」等小节）外，必须结合 **工作经历** 的 description 与 **项目经历** 的 projectDescription、projectAchievements 中实际出现或可合理归纳的技术要素进行补充，包括：编程语言、框架、库、数据库与中间件、云平台、工具链、工程实践相关术语等；表述用简短名词短语，去重，与原文表述一致或可核对，不得凭空捏造。
+6. 严禁混入其他候选人的信息；若原文无证据，不得编造。
+7. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+8. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
 
 简历内容：
 """{text}""""#,
@@ -192,11 +234,12 @@ fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
 
 要求：
 1. 保持 workExperience / projectExperience 的条目结构，不要把多段经历合并成一段。
-2. 可补充 description / projectDescription / projectAchievements 的细节，但不要编造不存在的公司/项目。
+2. 可补充 description / projectDescription / projectAchievements 的细节，但不要编造不存在的公司/项目。补全 projectAchievements 时，**优先从原文「项目业绩」「项目成果」「业绩」「效果」等小节或项目块内的成果描述完整迁入**，与 projectDescription 分工：描述讲“做了什么”，成果讲“效果与业绩”。
 3. projectExperience 的条目数量不得少于第一阶段，不能因为补全而删减已有项目。
-4. 严禁混入其他候选人的信息；只有简历原文可找到依据的经历才能保留。
-5. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
-6. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
+4. 同步检查并完善 basicInfo.skills：在第一阶段已有技能基础上，根据本阶段补全后的 **工作经历、项目经历** 全文，补充其中出现或可归纳的技术技能（须能在原简历中核对，表述简短、去重）；若经历中无新增技术信息则保持原 skills。
+5. 严禁混入其他候选人的信息；只有简历原文可找到依据的经历才能保留。
+6. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
+7. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
 
 简历内容：
 """{text}""""#,
@@ -206,32 +249,77 @@ fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
   )
 }
 
+fn llm_log_prefix(label: &str) -> &'static str {
+  if label == "stage1" || label == "stage2" {
+    "resume_parse"
+  } else {
+    "app_llm"
+  }
+}
+
+/// 统一入口：Ollama `/api/generate` 或 LM Studio OpenAI 兼容 `POST .../chat/completions`。
+pub fn complete_json_prompt(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+) -> Result<String, AppError> {
+  if provider_is_lmstudio(&settings.llm_provider) {
+    run_lmstudio_json(label, prompt, settings, params)
+  } else {
+    run_ollama_json_params(label, prompt, settings, params)
+  }
+}
+
 fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<String, AppError> {
+  complete_json_prompt(
+    label,
+    prompt,
+    settings,
+    JsonPromptParams {
+      temperature: settings.temperature,
+      ollama_num_ctx: RESUME_PARSE_NUM_CTX,
+      ollama_num_predict: Some(OLLAMA_NUM_PREDICT),
+    },
+  )
+}
+
+fn run_ollama_json_params(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+) -> Result<String, AppError> {
   let base_url = normalize_ollama_base_url(&settings.llama_cli_path);
   let endpoint = format!("{}/api/generate", base_url);
+
+  let mut opts = serde_json::Map::new();
+  opts.insert("temperature".into(), json!(params.temperature));
+  opts.insert("num_ctx".into(), json!(params.ollama_num_ctx));
+  opts.insert("num_thread".into(), json!(settings.threads));
+  if let Some(np) = params.ollama_num_predict {
+    opts.insert("num_predict".into(), json!(np));
+  }
 
   let body = json!({
     "model": settings.model_path.trim(),
     "prompt": prompt,
     "format": "json",
     "stream": false,
-    "options": {
-      "temperature": settings.temperature,
-      "num_ctx": RESUME_PARSE_NUM_CTX,
-      "num_thread": settings.threads,
-      "num_predict": OLLAMA_NUM_PREDICT,
-    }
+    "options": Value::Object(opts),
   });
 
+  let np_log = params.ollama_num_predict.unwrap_or(-1);
   resume_parse_log!(
     debug,
-    "resume_parse: [{}] POST {} prompt_chars={} timeout_s={} max_attempts={} num_predict={}",
+    "{}: [{}] POST {} prompt_chars={} timeout_s={} max_attempts={} num_predict={}",
+    llm_log_prefix(label),
     label,
     endpoint,
     prompt.chars().count(),
     OLLAMA_REQUEST_TIMEOUT_SECS,
     OLLAMA_MAX_ATTEMPTS,
-    OLLAMA_NUM_PREDICT
+    np_log
   );
 
   let mut last_err: Option<String> = None;
@@ -249,7 +337,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
         if attempt < OLLAMA_MAX_ATTEMPTS {
           resume_parse_log!(
             warn,
-            "resume_parse: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
+            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
+            llm_log_prefix(label),
             label,
             attempt,
             OLLAMA_MAX_ATTEMPTS,
@@ -262,7 +351,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
         }
         resume_parse_log!(
           error,
-          "resume_parse: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
+          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
+          llm_log_prefix(label),
           label,
           attempt,
           OLLAMA_MAX_ATTEMPTS,
@@ -279,17 +369,16 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
       }
     };
 
-    let payload: Value = resp
-      .into_json()
-      .map_err(|e| {
-        resume_parse_log!(
-          error,
-          "resume_parse: [{}] 解析 Ollama JSON 响应失败: {}",
-          label,
-          e
-        );
-        AppError::msg(format!("解析 Ollama 响应失败：{}", e))
-      })?;
+    let payload: Value = resp.into_json().map_err(|e| {
+      resume_parse_log!(
+        error,
+        "{}: [{}] 解析 Ollama JSON 响应失败: {}",
+        llm_log_prefix(label),
+        label,
+        e
+      );
+      AppError::msg(format!("解析 Ollama 响应失败：{}", e))
+    })?;
 
     let raw_text = payload
       .get("response")
@@ -297,7 +386,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
       .ok_or_else(|| {
         resume_parse_log!(
           error,
-          "resume_parse: [{}] 响应缺少 response 字段 payload={}",
+          "{}: [{}] 响应缺少 response 字段 payload={}",
+          llm_log_prefix(label),
           label,
           payload
         );
@@ -312,7 +402,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
         if attempt < OLLAMA_MAX_ATTEMPTS {
           resume_parse_log!(
             warn,
-            "resume_parse: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 raw_prefix={}",
+            "{}: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 raw_prefix={}",
+            llm_log_prefix(label),
             label,
             attempt,
             OLLAMA_MAX_ATTEMPTS,
@@ -324,7 +415,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
         }
         resume_parse_log!(
           error,
-          "resume_parse: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
+          "{}: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
+          llm_log_prefix(label),
           label,
           clip(raw_text, 800)
         );
@@ -340,7 +432,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
         if attempt < OLLAMA_MAX_ATTEMPTS {
           resume_parse_log!(
             warn,
-            "resume_parse: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
+            "{}: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
+            llm_log_prefix(label),
             label,
             attempt,
             OLLAMA_MAX_ATTEMPTS,
@@ -353,7 +446,8 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
         }
         resume_parse_log!(
           error,
-          "resume_parse: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
+          "{}: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
+          llm_log_prefix(label),
           label,
           attempt,
           OLLAMA_MAX_ATTEMPTS,
@@ -370,6 +464,359 @@ fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<
     label,
     last_err.unwrap_or_else(|| "未知错误".to_string())
   )))
+}
+
+fn lmstudio_max_tokens(params: &JsonPromptParams) -> u32 {
+  let n = params.ollama_num_predict.unwrap_or(4096);
+  n.clamp(256, 32768) as u32
+}
+
+fn run_lmstudio_json(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+) -> Result<String, AppError> {
+  let base_url = normalize_lmstudio_base_url(&settings.llama_cli_path);
+  let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+  let max_tokens = lmstudio_max_tokens(&params);
+  let schema_name = if label == "stage1" || label == "stage2" {
+    "resume_parse_schema"
+  } else {
+    "generic_json_schema"
+  };
+  let response_format = if label == "stage1" || label == "stage2" {
+    json!({
+      "type": "json_schema",
+      "json_schema": {
+        "name": schema_name,
+        "strict": true,
+        "schema": resume_json_schema()
+      }
+    })
+  } else {
+    json!({ "type": "json_object" })
+  };
+
+  let body = json!({
+    "model": settings.model_path.trim(),
+    "messages": [
+      { "role": "user", "content": prompt }
+    ],
+    "temperature": params.temperature,
+    "max_tokens": max_tokens,
+    "stream": false,
+    // LM Studio(OpenAI 兼容)结构化输出：阶段1/2使用 JSON Schema 强约束。
+    "response_format": response_format
+  });
+
+  resume_parse_log!(
+    debug,
+    "{}: [{}] POST {} prompt_chars={} timeout_s={} max_attempts={} max_tokens={}",
+    llm_log_prefix(label),
+    label,
+    endpoint,
+    prompt.chars().count(),
+    OLLAMA_REQUEST_TIMEOUT_SECS,
+    OLLAMA_MAX_ATTEMPTS,
+    max_tokens
+  );
+
+  let mut last_err: Option<String> = None;
+  for attempt in 1..=OLLAMA_MAX_ATTEMPTS {
+    let result = ureq::post(&endpoint)
+      .set("Content-Type", "application/json")
+      .timeout(Duration::from_secs(OLLAMA_REQUEST_TIMEOUT_SECS))
+      .send_json(body.clone());
+
+    let resp = match result {
+      Ok(resp) => resp,
+      Err(e) => {
+        let err_text = e.to_string();
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
+            llm_log_prefix(label),
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            base_url,
+            err_text,
+            OLLAMA_RETRY_DELAY_MS
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
+          llm_log_prefix(label),
+          label,
+          attempt,
+          OLLAMA_MAX_ATTEMPTS,
+          base_url,
+          err_text
+        );
+        return Err(AppError::msg(format!(
+          "调用 LM Studio 失败（阶段：{}，已重试 {} 次）：{}。请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。",
+          label,
+          OLLAMA_MAX_ATTEMPTS,
+          err_text,
+          base_url
+        )));
+      }
+    };
+
+    let payload: Value = resp.into_json().map_err(|e| {
+      resume_parse_log!(
+        error,
+        "{}: [{}] 解析 LM Studio JSON 响应失败: {}",
+        llm_log_prefix(label),
+        label,
+        e
+      );
+      AppError::msg(format!("解析 LM Studio 响应失败：{}", e))
+    })?;
+
+    if let Some(err) = payload.get("error") {
+      let msg = err.to_string();
+      resume_parse_log!(
+        error,
+        "{}: [{}] LM Studio 返回 error: {}",
+        llm_log_prefix(label),
+        label,
+        msg
+      );
+      return Err(AppError::msg(format!("LM Studio 返回错误：{}", msg)));
+    }
+
+    let first_choice = payload
+      .get("choices")
+      .and_then(|c| c.as_array())
+      .and_then(|a| a.first())
+      .ok_or_else(|| {
+        resume_parse_log!(
+          error,
+          "{}: [{}] 响应缺少 choices[0] payload={}",
+          llm_log_prefix(label),
+          label,
+          payload
+        );
+        AppError::msg(format!("LM Studio 响应缺少 choices[0]：{}", payload))
+      })?;
+
+    let finish_reason = first_choice
+      .get("finish_reason")
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+    let message = first_choice.get("message").and_then(|m| m.as_object()).ok_or_else(|| {
+      resume_parse_log!(
+        error,
+        "{}: [{}] 响应缺少 choices[0].message payload={}",
+        llm_log_prefix(label),
+        label,
+        payload
+      );
+      AppError::msg(format!("LM Studio 响应缺少 choices[0].message：{}", payload))
+    })?;
+    let content_text = message
+      .get("content")
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+    let reasoning_text = message
+      .get("reasoning_content")
+      .and_then(|v| v.as_str())
+      .unwrap_or("");
+    let (raw_text, source_field) = if !content_text.trim().is_empty() {
+      (content_text, "content")
+    } else if !reasoning_text.trim().is_empty() {
+      resume_parse_log!(
+        warn,
+        "{}: [{}] content 为空，回退使用 reasoning_content finish_reason={}",
+        llm_log_prefix(label),
+        label,
+        finish_reason
+      );
+      (reasoning_text, "reasoning_content")
+    } else {
+      resume_parse_log!(
+        error,
+        "{}: [{}] message.content 与 reasoning_content 均为空 finish_reason={} payload={}",
+        llm_log_prefix(label),
+        label,
+        finish_reason,
+        payload
+      );
+      return Err(AppError::msg(format!(
+        "LM Studio 响应内容为空（content/reasoning_content 均为空，finish_reason={}）",
+        finish_reason
+      )));
+    };
+
+    let extracted = match extract_json_object(raw_text) {
+      Some(v) => v,
+      None => {
+        let err_text = format!("模型输出中未找到 JSON 对象。原始输出前800字符：{}", clip(raw_text, 800));
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 source={} finish_reason={} raw_prefix={}",
+            llm_log_prefix(label),
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            OLLAMA_RETRY_DELAY_MS,
+            source_field,
+            finish_reason,
+            clip(raw_text, 400)
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] 无法从模型输出中提取 JSON，source={} finish_reason={} raw_prefix={}",
+          llm_log_prefix(label),
+          label,
+          source_field,
+          finish_reason,
+          clip(raw_text, 800)
+        );
+        return Err(AppError::msg(err_text));
+      }
+    };
+
+    match serde_json::from_str::<Value>(&extracted) {
+      Ok(_) => return Ok(extracted),
+      Err(e) => {
+        let err_text = format!("模型输出 JSON 语法错误：{}", e);
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
+            llm_log_prefix(label),
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            e,
+            OLLAMA_RETRY_DELAY_MS,
+            clip(&extracted, 400)
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
+          llm_log_prefix(label),
+          label,
+          attempt,
+          OLLAMA_MAX_ATTEMPTS,
+          e,
+          clip(&extracted, 800)
+        );
+        return Err(AppError::msg(format!("{}。原始输出前800字符：{}", err_text, clip(&extracted, 800))));
+      }
+    }
+  }
+
+  Err(AppError::msg(format!(
+    "调用 LM Studio 失败（阶段：{}）：{}",
+    label,
+    last_err.unwrap_or_else(|| "未知错误".to_string())
+  )))
+}
+
+fn resume_json_schema() -> Value {
+  json!({
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["basicInfo", "workExperience", "projectExperience"],
+    "properties": {
+      "basicInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "age", "contact", "gender", "education", "skills", "certificates"],
+        "properties": {
+          "name": { "type": "string" },
+          "age": { "type": "string" },
+          "contact": { "type": "string" },
+          "gender": { "type": "string" },
+          "education": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["school", "major", "degree", "period"],
+              "properties": {
+                "school": { "type": "string" },
+                "major": { "type": "string" },
+                "degree": { "type": "string" },
+                "period": { "type": "string" }
+              }
+            }
+          },
+          "skills": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "certificates": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "workExperience": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["company", "position", "period", "description"],
+          "properties": {
+            "company": { "type": "string" },
+            "position": { "type": "string" },
+            "period": { "type": "string" },
+            "description": { "type": "string" }
+          }
+        }
+      },
+      "projectExperience": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["projectName", "projectDescription", "projectAchievements"],
+          "properties": {
+            "projectName": { "type": "string" },
+            "projectDescription": { "type": "string" },
+            "projectAchievements": { "type": "string" }
+          }
+        }
+      }
+    }
+  })
+}
+
+pub fn normalize_lmstudio_base_url(input: &str) -> String {
+  let raw = input.trim();
+  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
+    "http://127.0.0.1:1234".to_string()
+  } else if raw.starts_with("http://") || raw.starts_with("https://") {
+    raw.trim_end_matches('/').to_string()
+  } else {
+    format!("http://{}", raw.trim_end_matches('/'))
+  };
+
+  let base = base.trim_end_matches('/');
+  if base.to_ascii_lowercase().ends_with("/v1") {
+    base.to_string()
+  } else {
+    format!("{}/v1", base)
+  }
 }
 
 fn normalize_ollama_base_url(input: &str) -> String {
@@ -473,10 +920,34 @@ fn parse_resume_data_flexible(s: &str) -> Result<ResumeData, String> {
   }
 
   let mut v: Value = serde_json::from_str(s).map_err(|e| format!("JSON语法错误：{}", e))?;
+  unwrap_wrapped_resume_payload(&mut v);
   repair_resume_value(&mut v);
 
   serde_json::from_value::<ResumeData>(v.clone())
     .map_err(|e| format!("结构修复后仍不匹配：{}；修复后JSON前1200字符：{}", e, clip(&v.to_string(), 1200)))
+}
+
+/// 兼容某些推理模型返回包装结构：
+/// 1) {"response":"{...真正JSON...}"}（内层是 JSON 字符串）
+/// 2) {"name":"解析简历（第一阶段...）","response":"..."}（顶层字段仅为包装元信息）
+fn unwrap_wrapped_resume_payload(v: &mut Value) {
+  let Some(obj) = v.as_object() else {
+    return;
+  };
+  let response_text = obj.get("response").and_then(|x| x.as_str()).map(|x| x.trim().to_string());
+  let Some(resp) = response_text else {
+    return;
+  };
+  if resp.is_empty() {
+    return;
+  }
+
+  let candidate = extract_json_object(&resp).unwrap_or(resp);
+  if let Ok(inner) = serde_json::from_str::<Value>(&candidate) {
+    if inner.is_object() {
+      *v = inner;
+    }
+  }
 }
 
 fn repair_resume_value(v: &mut Value) {
@@ -511,6 +982,9 @@ fn repair_resume_value(v: &mut Value) {
     root.insert("basicInfo".to_string(), Value::Object(basic_obj));
   }
 
+  // 兼容部分模型把基础信息直接放在顶层（name/age/contact/...），而非 basicInfo。
+  merge_top_level_basic_fields(&mut root);
+
   ensure_object_field(&mut root, "basicInfo");
   ensure_object_field(&mut root, "workExperience");
   ensure_object_field(&mut root, "projectExperience");
@@ -530,6 +1004,46 @@ fn repair_resume_value(v: &mut Value) {
   sanitize_basic_info(&mut root);
 
   *v = Value::Object(root);
+}
+
+fn merge_top_level_basic_fields(root: &mut Map<String, Value>) {
+  let mut basic = root
+    .get("basicInfo")
+    .and_then(|v| v.as_object())
+    .cloned()
+    .unwrap_or_default();
+
+  let scalar_keys = ["name", "age", "contact", "gender"];
+  for key in scalar_keys {
+    let should_fill = basic
+      .get(key)
+      .and_then(|v| v.as_str())
+      .map(|s| s.trim().is_empty())
+      .unwrap_or(true);
+    if !should_fill {
+      continue;
+    }
+    if let Some(v) = root.get(key).cloned() {
+      basic.insert(key.to_string(), v);
+    }
+  }
+
+  let collection_keys = ["education", "skills", "certificates"];
+  for key in collection_keys {
+    let should_fill = match basic.get(key) {
+      Some(Value::Array(arr)) => arr.is_empty(),
+      Some(Value::Null) | None => true,
+      _ => false,
+    };
+    if !should_fill {
+      continue;
+    }
+    if let Some(v) = root.get(key).cloned() {
+      basic.insert(key.to_string(), v);
+    }
+  }
+
+  root.insert("basicInfo".to_string(), Value::Object(basic));
 }
 
 fn alias_field(root: &mut Map<String, Value>, from: &str, to: &str) {
@@ -704,7 +1218,102 @@ fn preserve_work_items(stage1: &ResumeData, mut final_data: ResumeData) -> Resum
     );
     final_data.work_experience = stage1.work_experience.clone();
   }
+  // 条目数一致时，仍可能出现阶段2把时间段截断为“2018 年 09 月 -”这类不完整形式；
+  // 对同索引条目做逐项兜底，优先保留更完整的时间段。
+  backfill_work_periods_from_stage1(stage1, &mut final_data);
   final_data
+}
+
+fn looks_like_prompt_title_name(name: &str) -> bool {
+  let n = name.trim();
+  n.starts_with("解析简历（") || n.starts_with("解析简历(") || n.contains("第一阶段") || n.contains("第二阶段")
+}
+
+fn preserve_basic_and_details(stage1: &ResumeData, mut final_data: ResumeData) -> ResumeData {
+  let s1_name = stage1.basic_info.name.trim();
+  let s2_name = final_data.basic_info.name.trim();
+  if !s1_name.is_empty() && (s2_name.is_empty() || looks_like_prompt_title_name(s2_name)) {
+    resume_parse_log!(
+      warn,
+      "resume_parse: stage2 姓名疑似异常（'{}'），回退 stage1 姓名='{}'",
+      s2_name,
+      s1_name
+    );
+    final_data.basic_info.name = stage1.basic_info.name.clone();
+  }
+
+  for (idx, item) in final_data.work_experience.iter_mut() {
+    if let Some(s1) = stage1.work_experience.get(idx) {
+      if item.description.trim().is_empty() && !s1.description.trim().is_empty() {
+        item.description = s1.description.clone();
+      }
+      if item.company.trim().is_empty() && !s1.company.trim().is_empty() {
+        item.company = s1.company.clone();
+      }
+      if item.position.trim().is_empty() && !s1.position.trim().is_empty() {
+        item.position = s1.position.clone();
+      }
+    }
+  }
+
+  for (idx, item) in final_data.project_experience.iter_mut() {
+    if let Some(s1) = stage1.project_experience.get(idx) {
+      if item.project_description.trim().is_empty() && !s1.project_description.trim().is_empty() {
+        item.project_description = s1.project_description.clone();
+      }
+      if item.project_achievements.trim().is_empty() && !s1.project_achievements.trim().is_empty() {
+        item.project_achievements = s1.project_achievements.clone();
+      }
+      if item.project_name.trim().is_empty() && !s1.project_name.trim().is_empty() {
+        item.project_name = s1.project_name.clone();
+      }
+    }
+  }
+
+  final_data
+}
+
+fn looks_incomplete_period(period: &str) -> bool {
+  let p = period.trim();
+  if p.is_empty() {
+    return true;
+  }
+  let compact = p.replace(' ', "");
+  compact.ends_with('-')
+    || compact.ends_with('－')
+    || compact.ends_with('–')
+    || compact.ends_with('—')
+    || compact.ends_with("至")
+    || compact.ends_with("到")
+}
+
+fn is_more_complete_period(candidate: &str, current: &str) -> bool {
+  let c = candidate.trim();
+  let cur = current.trim();
+  if c.is_empty() {
+    return false;
+  }
+  if looks_incomplete_period(cur) && !looks_incomplete_period(c) {
+    return true;
+  }
+  c.chars().count() > cur.chars().count() + 2
+}
+
+fn backfill_work_periods_from_stage1(stage1: &ResumeData, final_data: &mut ResumeData) {
+  for (idx, final_item) in final_data.work_experience.iter_mut() {
+    if let Some(stage1_item) = stage1.work_experience.get(idx) {
+      if is_more_complete_period(&stage1_item.period, &final_item.period) {
+        resume_parse_log!(
+          debug,
+          "resume_parse: work period backfill idx={} from='{}' to='{}'",
+          idx,
+          final_item.period,
+          stage1_item.period
+        );
+        final_item.period = stage1_item.period.clone();
+      }
+    }
+  }
 }
 
 fn count_non_empty_work(items: &BTreeMap<String, WorkItem>) -> usize {
