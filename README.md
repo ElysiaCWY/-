@@ -25,61 +25,68 @@
 - `rusqlite`：SQLite（解析结果索引库，用于 JD 筛选）
 - `log` + `env_logger`：控制台日志；解析相关行同时写入项目内 `logs/app.log`（见下文「日志」）
 
-## 目录结构（核心）
+# Resume Manager（本地解析）
 
-- `src-tauri/src/main.rs`：Tauri 命令注册与入口
-- `src-tauri/src/extract/`：简历文件文本抽取
-- `src-tauri/src/llm.rs`：调用模型进行结构化解析（单阶段一次请求、结果归一与来源过滤）
-- `src-tauri/src/jd.rs`：JD 需求结构化与加权评分（含旧版关键词 v1 接口）
-- `src-tauri/src/storage.rs`：本地 JSON 存储、SQLite、解析归档与去重
-- `src-tauri/src/schema.rs`：数据结构定义
-- `src-tauri/src/validate.rs`：解析结果规范化
-- `src-tauri/src/export_js.rs`：导出 `resume_data.js`
-- `src-tauri/src/app_log.rs`：应用日志落盘（含 `resume_parse` 宏）
-- `ui/dashboard.html`：前端单页入口（包含各功能区块）
-- `ui/main.js`：前端交互与 Tauri 命令调用
-- `ui/style.css`：界面样式
-- `start.ps1` / `start.bat`：Windows 一键启动脚本
-- `解析结果模板.json`：结构化输出字段模板（含 `basicInfo.contact` 等）；构建时会 **嵌入程序**，分发绿色包可不附带；若与 exe 同目录放置同名文件则 **覆盖内置模板**
+简要说明
+Resume Manager 是一款面向 Windows 的本地桌面工具，基于 Tauri + Rust，提供从 PDF/DOCX 抽取简历文本、调用本地模型进行结构化解析、维护本地简历库并对 JD 进行结构化匹配与加权评分的完整离线流程。
 
-## 功能说明
+快速开始（开发环境）
 
-### 1. 简历导入与文本抽取
+1. 克隆仓库并进入目录：
 
-后端命令：`extract_text(file_path)`
+   git clone https://github.com/ElysiaCWY/Resume-database.git
+   cd Resume-database
 
-当前支持：
+2. 安装依赖并启动开发模式（Windows）：
 
-- `.pdf`
-- `.docx`
+   npm install
+   npm run tauri:dev
 
-当前不支持（会返回明确报错）：
+运行与打包（生成可分发 exe）
 
-- `.doc`（提示先转 `.docx`）
-- 图片类 `.png/.jpg/.jpeg/.webp`（OCR 暂未启用）
+- 依赖：Node.js (LTS)、Rust toolchain (rustup/cargo)。
+- 构建：
 
-前端「导入与解析」文件选择器当前仅开放 **`.docx`、`.pdf`**，与上述能力一致。
+  npm install
+  npm run tauri build
 
-### 2. 本地模型结构化解析
+  可执行文件通常位于 `src-tauri/target/release/`。
 
-后端命令：`parse_resume(text, settings)`，返回 `ResumeParseOutput`（字段 `resume` + `jdScreeningIndex`，与模型同轮 JSON 一致）。
+主要功能概览
 
-解析策略：
+- 文本抽取：支持 `.pdf`、`.docx`（后端命令 `extract_text(file_path)`）。
+- 结构化解析：调用 Ollama 或 LM Studio（由 `app-config.json` 配置），命令 `parse_resume(text, settings)` 返回标准化 JSON。
+- 解析存储：解析结果保存到 `parsed-results/` 并写入 `data/resumes.db`（SQLite 索引）。
+- JD 筛选：先 SQL 预过滤（最低学历/年限），再按加权规则计算总分（技/年/学/工/项）。
 
-- 基于 Ollama `/api/generate` 或 OpenAI 兼容接口的 **单阶段** 解析：一次请求输出完整结构与经历/项目描述（相对原两阶段可少一半云端往返）；单次请求在 `llm.rs` 内对网络或 JSON 格式问题仍有有限次自动重试
-- 模型须返回顶层 `resume` + `jdScreeningIndex`；落盘为同目录 `*.json` 与 `*.jd-screening.json`，SQLite 存 `jd_screening_json_path`；JD 筛选 HR/模型打分时 **优先** 使用索引 JSON 以压缩 token，缺失时回退为完整简历
-- 简历解析请求中 Ollama **`num_ctx` 为 65536**（可按机器与模型能力在 `llm.rs` 中调整）
-- 提取 JSON 后做结构修复与归一（如 `basicInfo` 的 `phone`/`mobile` 等别名归一到 `contact`；证书字段若被模型输出为 `{name,period}` 对象数组，会合并为字符串以符合 `Vec<String>`）
-- 解析结束后对来源文本做 **证据过滤**：项目经历在「项目名非空」时默认保留；工作经历在「公司或职位非空」时默认保留，减少原文与模型措辞略不一致时的误删
+配置（`app-config.json`）
 
-设置项（见 `app-config.json`）：
+- `llmProvider`: `ollama` 或 `lmstudio`。
+- `llamaCliPath`: Ollama/LM Studio 地址（例如 `http://127.0.0.1:11434`）。
+- `modelPath`: 模型名或 model id。
+- `threads`, `temperature`: 推理参数。
 
-- `llmProvider`：本地模型后端，`ollama`（默认）或 `lmstudio`（LM Studio 的 OpenAI 兼容接口）
-- `llamaCliPath`：Ollama 时为服务根地址（默认 `http://127.0.0.1:11434`）；LM Studio 时为 OpenAI 兼容根地址（可留空，默认 `http://127.0.0.1:1234/v1`）
-- `modelPath`：Ollama 时为模型名；LM Studio 时为当前已加载模型在 API 中使用的 **model id**（与 LM Studio 界面一致）
-- `threads`：推理线程数（Ollama 生效；LM Studio 由服务端/模型侧决定）
-- `temperature`：采样温度
+数据与日志
 
+- 用户级数据：`%LOCALAPPDATA%/resume-manager/`（`resumes.json`, `jds.json`）。
+- 项目内索引：`data/resumes.db`、`parsed-results/`、`parsed-results/parsed-index.json`。
+- 日志：`logs/app.log`（项目根，解析记录含 `resume_parse:` 前缀）。
+
+限制与建议
+
+- 暂不支持 `.doc` 与图片 OCR；如需处理扫描件建议接入 OCR（PaddleOCR/Tesseract）。
+- 同人去重依赖 `姓名 + 年龄 + 联系方式` 三者齐全；缺失时不会去重。
+- 超长简历可能受上下文长度限制，必要时可调整模型上下文或采用分段解析。
+
+贡献与支持
+
+- 欢迎提交 issue / PR；提交前请附上复现步骤和期望行为。
+
+远程仓库
+
+- 已推送： https://github.com/ElysiaCWY/Resume-database
+
+如需我把 README 再细化为「API 使用示例」「前端页面说明」「PDF 导出流程」等，告诉我具体要补充的部分，我会继续提交更新。
 ### 3. 结果导出与落盘
 
 后端命令：
