@@ -29,7 +29,7 @@
 
 - `src-tauri/src/main.rs`：Tauri 命令注册与入口
 - `src-tauri/src/extract/`：简历文件文本抽取
-- `src-tauri/src/llm.rs`：调用本地模型进行结构化解析（两阶段、结果归一与来源过滤）
+- `src-tauri/src/llm.rs`：调用模型进行结构化解析（单阶段一次请求、结果归一与来源过滤）
 - `src-tauri/src/jd.rs`：JD 需求结构化与加权评分（含旧版关键词 v1 接口）
 - `src-tauri/src/storage.rs`：本地 JSON 存储、SQLite、解析归档与去重
 - `src-tauri/src/schema.rs`：数据结构定义
@@ -62,16 +62,13 @@
 
 ### 2. 本地模型结构化解析
 
-后端命令：`parse_resume(text, settings)`
+后端命令：`parse_resume(text, settings)`，返回 `ResumeParseOutput`（字段 `resume` + `jdScreeningIndex`，与模型同轮 JSON 一致）。
 
 解析策略：
 
-- 基于 Ollama `/api/generate` 的 **两阶段** 解析：
-  - **第一阶段**：优先抽取稳定结构（公司/岗位/时间段/项目名等）
-  - **第二阶段**：在第一阶段骨架上补全描述细节
-- **第二阶段失败**时自动回退第一阶段结果，避免整条任务失败
-- **第二阶段若将工作经历条数变少**，会 **回退第一阶段的工作经历**（避免模型合并/删减导致只剩一条）
-- 简历解析请求中 Ollama **`num_ctx` 为 32768**（可按机器与模型能力在 `llm.rs` 中调整）
+- 基于 Ollama `/api/generate` 或 OpenAI 兼容接口的 **单阶段** 解析：一次请求输出完整结构与经历/项目描述（相对原两阶段可少一半云端往返）；单次请求在 `llm.rs` 内对网络或 JSON 格式问题仍有有限次自动重试
+- 模型须返回顶层 `resume` + `jdScreeningIndex`；落盘为同目录 `*.json` 与 `*.jd-screening.json`，SQLite 存 `jd_screening_json_path`；JD 筛选 HR/模型打分时 **优先** 使用索引 JSON 以压缩 token，缺失时回退为完整简历
+- 简历解析请求中 Ollama **`num_ctx` 为 65536**（可按机器与模型能力在 `llm.rs` 中调整）
 - 提取 JSON 后做结构修复与归一（如 `basicInfo` 的 `phone`/`mobile` 等别名归一到 `contact`；证书字段若被模型输出为 `{name,period}` 对象数组，会合并为字符串以符合 `Vec<String>`）
 - 解析结束后对来源文本做 **证据过滤**：项目经历在「项目名非空」时默认保留；工作经历在「公司或职位非空」时默认保留，减少原文与模型措辞略不一致时的误删
 
@@ -87,7 +84,7 @@
 
 后端命令：
 
-- `save_parsed_result_json(source_file, resume_obj)`
+- `save_parsed_result_json(source_file, resumeId, resumeObj, jdScreeningIndex)`：写入两份 JSON（`*.json` 与 `*.jd-screening.json`）并更新索引与 SQLite（含 `jd_screening_json_path`）
 - `export_js(resume_obj, out_path)`（仍保留，按需手动导出）
 - `export_resume_pdf` / `export_resume_pdf_from_json`：标准简历模板 **PDF** 导出（JD 页「生成标准简历」流程）
 
@@ -129,7 +126,7 @@
 - `jd_score_v1(resume_obj, jd_text)`：旧版关键词快筛（保留兼容）
 - `jd_filter_by_keywords(position, jdText, limit)`：**当前 JD 页「计算匹配分」使用的主流程**
   - 用本地模型从「岗位 + JD 文本」提取结构化需求（学历门槛、年限、技能与工作/项目关键词等）
-  - 在 SQLite 中先做 **SQL 预过滤**（岗位、最低年限、最低学历）
+  - 在 SQLite 中先做 **SQL 预过滤**（仅 **最低年限、最低学历**；不再用解析表里的 `position` 与界面岗位做子串匹配，避免「Java 开发 vs 后端开发」等表述差异误杀）
   - 再对候选人计算 **加权总分**（分项 0–100，最终总分 0–100）  
     `总分 = 技能×0.3 + 年限×0.2 + 学历×0.1 + 工作经历×0.2 + 项目×0.2`  
     其中 **年限分项** 使用平滑函数（非阶梯分段）
@@ -243,6 +240,26 @@ npm run tauri build
 2. 安装并启动 Ollama，拉取配置中的模型
 3. 双击 `resume-manager.exe`
 
+### 主题版 PDF 一键启动（可选）
+
+若希望在接收方机器上尽量自动准备「主题版 PDF」导出环境，可在分发包中附带（**须与 `resume-manager.exe`、`app-config.json` 放在同一目录**）：
+
+- `start-theme-export.bat`
+- `start-theme-export.ps1`
+- `package.json`（**必需**，否则脚本会报错并无法安装 `resume-cli`）
+- `package-lock.json`（建议一并带上，安装更稳定）
+
+**常见错误**：只复制了 exe 和启动脚本，没有 `package.json`，会导致「找不到 package.json」。请从完整项目或发布包中复制上述文件。
+
+接收方双击 `start-theme-export.bat` 后，脚本会：
+
+1. 检查 Node.js / npm
+2. 自动执行 `npm install`（仅首次）
+3. 校验 `node_modules/.bin/resume.cmd`（主题导出所需）
+4. 自动启动 `resume-manager.exe`
+
+若任一步失败，脚本会显示错误原因。未满足主题链路时，程序仍可导出内置普通 PDF。
+
 ## 使用流程（建议）
 
 1. 编辑项目根目录 `app-config.json`，填写 `llamaCliPath` 与 `modelPath`
@@ -275,7 +292,7 @@ npm run tauri build
 - `.doc` 尚不直接支持（需先另存为 `.docx`）
 - JD 匹配依赖本地模型提取结构化需求，模型或配置异常时可能影响筛选质量
 - 同人去重依赖 **姓名+年龄+联系方式** 三者齐全；若简历未解析出联系方式，则不会触发该去重逻辑
-- 超长简历仍受 **模型上下文长度** 与输出稳定性影响；已使用较大 `num_ctx`、两阶段与工作经历条数回退等兜底，极端长文仍可能不完整
+- 超长简历仍受 **模型上下文长度** 与输出稳定性影响；已使用较大 `num_ctx` 等设置，极端长文仍可能不完整
 - 当前前端为单页结构，统一在 `dashboard.html` + `main.js` 中完成页面切换与交互
 
 ## 后续建议

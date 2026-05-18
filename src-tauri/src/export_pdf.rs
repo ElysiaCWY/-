@@ -1,4 +1,5 @@
 use crate::errors::AppError;
+use crate::json_resume::PdfExportOptions;
 use crate::schema::{ProjectItem, ResumeData, WorkItem};
 use printpdf::ops::PdfFontHandle;
 use printpdf::{Mm, Op, ParsedFont, PdfDocument, PdfPage, PdfSaveOptions, Point, Pt, TextItem};
@@ -326,22 +327,32 @@ fn sort_map_keys_numeric(keys: impl Iterator<Item = std::string::String>) -> Vec
 }
 
 /// 与前端 `buildTemplateBlock` 对齐的 Markdown 风格纯文本，供无 Node 时使用 `write_resume_pdf` 生成 PDF。
-pub fn resume_data_to_plain_pdf_content(resume: &ResumeData, include_skills: bool) -> String {
+pub fn resume_data_to_plain_pdf_content(resume: &ResumeData, options: PdfExportOptions) -> String {
   let b = &resume.basic_info;
   let mut lines: Vec<String> = Vec::new();
   let name = inline_clean(&b.name);
   lines.push(format!(
     "# {}",
-    if name.is_empty() {
+    if !options.include_name || name.is_empty() {
       "候选人姓名"
     } else {
       name.as_str()
     }
   ));
-  lines.push("## 基础信息".to_string());
-  lines.push(format!("- 性别：{}", dash_or(&b.gender)));
-  lines.push(format!("- 年龄：{}", dash_or(&b.age)));
-  lines.push(format!("- 联系方式：{}", dash_or(&b.contact)));
+  let mut basic_lines: Vec<String> = Vec::new();
+  if options.include_gender {
+    basic_lines.push(format!("- 性别：{}", dash_or(&b.gender)));
+  }
+  if options.include_age {
+    basic_lines.push(format!("- 年龄：{}", dash_or(&b.age)));
+  }
+  if options.include_contact {
+    basic_lines.push(format!("- 联系方式：{}", dash_or(&b.contact)));
+  }
+  if !basic_lines.is_empty() {
+    lines.push("## 基础信息".to_string());
+    lines.extend(basic_lines);
+  }
 
   let edu: Vec<_> = b
     .education
@@ -366,7 +377,7 @@ pub fn resume_data_to_plain_pdf_content(resume: &ResumeData, include_skills: boo
     }
   }
 
-  if include_skills && !b.skills.is_empty() {
+  if options.include_skills && !b.skills.is_empty() {
     let s = b
       .skills
       .iter()

@@ -50,6 +50,7 @@ const parseProgressText = $("parseProgressText");
 const jdInput = $("jdInput");
 const jdPositionInput = $("jdPositionInput");
 const jdTopN = $("jdTopN");
+const jdRerankPool = $("jdRerankPool");
 const scoreOut = $("scoreOut");
 const parseQueue = $("parseQueue");
 const pageTitle = $("pageTitle");
@@ -62,11 +63,14 @@ const libraryKeyword = $("libraryKeyword");
 const libraryDegree = $("libraryDegree");
 const libraryYears = $("libraryYears");
 const librarySkill = $("librarySkill");
+const libraryDeleteSelectedBtn = $("libraryDeleteSelectedBtn");
+const librarySelectAll = $("librarySelectAll");
 const templatePreview = $("templatePreview");
 const resumeDetailContent = $("resumeDetailContent");
 const resumeDetailBasic = $("resumeDetailBasic");
 const resumeDetailWorkBody = $("resumeDetailWorkBody");
 const resumeDetailProjectBody = $("resumeDetailProjectBody");
+const resumeDetailJdSummary = $("resumeDetailJdSummary");
 const resumeDetailBack = $("resumeDetailBack");
 const jdCompareBack = $("jdCompareBack");
 const jdCompareReportContent = $("jdCompareReportContent");
@@ -84,6 +88,7 @@ let lastJdRankingRows = [];
 let resumeDetailBackTarget = "library";
 let selectedTemplateKeys = new Set();
 let filteredLibraryRecords = [];
+let selectedLibraryIds = new Set();
 let importInProgress = false;
 let appSettings = {
   llama_cli_path: "",
@@ -91,6 +96,8 @@ let appSettings = {
   threads: 4,
   temperature: 0.1,
   llm_provider: "ollama",
+  llm_api_key: "",
+  cloud_max_output_tokens: null,
 };
 
 const TITLE_MAP = {
@@ -101,6 +108,7 @@ const TITLE_MAP = {
   jd: "JD 管理 & 筛选",
   jdCompareReport: "候选人对比报告",
   resumeDetail: "简历详情",
+  settings: "AI 配置",
 };
 
 const PAGE_KEYS = Object.keys(TITLE_MAP);
@@ -114,6 +122,9 @@ function switchPage(page, syncHash = true) {
   pageTitle.textContent = TITLE_MAP[target] || "简历管理";
   if (syncHash && window.location.hash !== `#${target}`) {
     window.location.hash = target;
+  }
+  if (target === "settings") {
+    refreshAiSettingsPanel().catch(() => {});
   }
 }
 
@@ -171,6 +182,17 @@ function bindQuickActions() {
     libraryYears.value = "";
     librarySkill.value = "";
     filteredLibraryRecords = [...libraryRecords];
+    selectedLibraryIds.clear();
+    renderLibraryTable(filteredLibraryRecords);
+  });
+  libraryDeleteSelectedBtn?.addEventListener("click", handleDeleteSelectedResumes);
+  librarySelectAll?.addEventListener("change", () => {
+    const currentRows = filteredLibraryRecords.filter((r) => !!String(r?.id || "").trim());
+    if (librarySelectAll.checked) {
+      currentRows.forEach((r) => selectedLibraryIds.add(String(r.id)));
+    } else {
+      currentRows.forEach((r) => selectedLibraryIds.delete(String(r.id)));
+    }
     renderLibraryTable(filteredLibraryRecords);
   });
 
@@ -199,11 +221,11 @@ function bindQuickActions() {
         usedNameCount.set(baseName, seen + 1);
         const fileName = seen === 0 ? `${baseName}.pdf` : `${baseName}_${seen + 1}.pdf`;
         const targetPath = dirPath ? `${dirPath}${sep}${fileName}` : fileName;
-        const includeSkills = Boolean($("tplSkill")?.checked);
+        const options = getTemplateExportOptions();
         const jsonPath = String(item.row?.jsonPath || "").trim();
         try {
           if (jsonPath) {
-            await invoke("export_resume_pdf_from_json", { jsonPath, outPath: targetPath, includeSkills });
+            await invoke("export_resume_pdf_from_json", { jsonPath, outPath: targetPath, options });
           } else {
             const content = buildTemplateBlock(item.data);
             await invoke("export_resume_pdf", { content, outPath: targetPath });
@@ -382,6 +404,14 @@ async function loadSettingsFromFile() {
       llm_provider: String(s.llmProvider || "ollama")
         .trim()
         .toLowerCase() || "ollama",
+      llm_api_key: String(s.llmApiKey ?? s.llm_api_key ?? "").trim(),
+      cloud_max_output_tokens: (() => {
+        const v = s.cloudMaxOutputTokens ?? s.cloud_max_output_tokens;
+        if (v == null || v === "") return null;
+        const n = Number(v);
+        if (!Number.isFinite(n) || n < 2048) return null;
+        return Math.min(Math.floor(n), 65536);
+      })(),
     };
   } catch (e) {
     appSettings = {
@@ -390,9 +420,92 @@ async function loadSettingsFromFile() {
       threads: 4,
       temperature: 0.1,
       llm_provider: "ollama",
+      llm_api_key: "",
+      cloud_max_output_tokens: null,
     };
     alert(`加载配置失败：${String(e)}\n请检查项目根目录 app-config.json`);
   }
+  syncAiFormFromAppSettings();
+}
+
+function syncAiFormFromAppSettings() {
+  const prov = String(appSettings.llm_provider || "ollama").toLowerCase();
+  const sel = $("aiLlmProvider");
+  if (sel) {
+    const opts = [...sel.options].map((o) => o.value);
+    sel.value = opts.includes(prov) ? prov : "ollama";
+  }
+  const mp = $("aiModelPath");
+  if (mp) mp.value = appSettings.model_path || "";
+  const lp = $("aiLlamaCliPath");
+  if (lp) lp.value = appSettings.llama_cli_path || "";
+  const key = $("aiLlmApiKey");
+  if (key) key.value = appSettings.llm_api_key || "";
+  const th = $("aiThreads");
+  if (th) th.value = String(appSettings.threads ?? 4);
+  const te = $("aiTemperature");
+  if (te) te.value = String(appSettings.temperature ?? 0.1);
+  const cm = $("aiCloudMaxOutputTokens");
+  if (cm) {
+    const v = appSettings.cloud_max_output_tokens;
+    cm.value = v != null && Number.isFinite(Number(v)) ? String(v) : "";
+  }
+}
+
+function readAiSettingsFromForm() {
+  const cloudRaw = ($("aiCloudMaxOutputTokens")?.value || "").trim();
+  let cloudMaxOutputTokens = null;
+  if (cloudRaw) {
+    const n = parseInt(cloudRaw, 10);
+    if (Number.isFinite(n) && n >= 2048) cloudMaxOutputTokens = Math.min(n, 65536);
+  }
+  const threads = parseInt($("aiThreads")?.value || "4", 10);
+  const temp = Number($("aiTemperature")?.value);
+  return {
+    llmProvider: (($("aiLlmProvider")?.value || "ollama").trim().toLowerCase() || "ollama"),
+    modelPath: ($("aiModelPath")?.value || "").trim(),
+    llamaCliPath: ($("aiLlamaCliPath")?.value || "").trim(),
+    llmApiKey: ($("aiLlmApiKey")?.value || "").trim(),
+    threads: Math.min(64, Math.max(1, Number.isFinite(threads) ? threads : 4)),
+    temperature: Math.min(2, Math.max(0, Number.isFinite(temp) ? temp : 0.1)),
+    cloudMaxOutputTokens,
+  };
+}
+
+async function refreshAiSettingsPanel() {
+  syncAiFormFromAppSettings();
+  try {
+    const p = await invoke("get_app_settings_path");
+    const el = $("aiSettingsPathHint");
+    if (el) el.textContent = p;
+  } catch (e) {
+    const el = $("aiSettingsPathHint");
+    if (el) el.textContent = `无法解析配置路径：${String(e)}`;
+  }
+}
+
+function bindAiSettingsPage() {
+  $("aiSettingsSave")?.addEventListener("click", async () => {
+    try {
+      const settings = readAiSettingsFromForm();
+      await invoke("save_app_settings", { settings });
+      await loadSettingsFromFile();
+      const p = await invoke("get_app_settings_path");
+      const el = $("aiSettingsPathHint");
+      if (el) el.textContent = p;
+      alert(`已保存到：\n${p}`);
+    } catch (e) {
+      alert(String(e));
+    }
+  });
+  $("aiSettingsReload")?.addEventListener("click", async () => {
+    try {
+      await loadSettingsFromFile();
+      await refreshAiSettingsPanel();
+    } catch (e) {
+      alert(String(e));
+    }
+  });
 }
 
 function setBusy(b) {
@@ -403,9 +516,41 @@ function setBusy(b) {
   if (btnClear) btnClear.disabled = b;
 }
 
+function updateLibraryBulkDeleteState() {
+  if (!libraryDeleteSelectedBtn) return;
+  const selectedCount = selectedLibraryIds.size;
+  libraryDeleteSelectedBtn.disabled = selectedCount === 0;
+  libraryDeleteSelectedBtn.textContent = selectedCount > 0 ? `批量删除（${selectedCount}）` : "批量删除";
+}
+
+function syncLibrarySelectAllState(records = filteredLibraryRecords) {
+  if (!librarySelectAll) return;
+  const rows = records.filter((r) => !!String(r?.id || "").trim());
+  const selectedCount = rows.filter((r) => selectedLibraryIds.has(String(r.id))).length;
+  librarySelectAll.checked = rows.length > 0 && selectedCount === rows.length;
+  librarySelectAll.indeterminate = selectedCount > 0 && selectedCount < rows.length;
+}
+
+async function handleDeleteSelectedResumes() {
+  const ids = Array.from(selectedLibraryIds);
+  if (!ids.length) {
+    alert("请先勾选要删除的简历。");
+    return;
+  }
+  try {
+    await invoke("delete_resume_records", { ids });
+    selectedLibraryIds.clear();
+    await refreshLibraryAndStats();
+  } catch (e) {
+    alert(String(e));
+  }
+}
+
 function renderLibraryTable(records) {
   if (!records.length) {
-    libraryTableBody.innerHTML = '<tr><td colspan="9" class="muted">暂无简历数据</td></tr>';
+    libraryTableBody.innerHTML = '<tr><td colspan="10" class="muted">暂无简历数据</td></tr>';
+    syncLibrarySelectAllState(records);
+    updateLibraryBulkDeleteState();
     return;
   }
   libraryTableBody.innerHTML = records
@@ -415,7 +560,9 @@ function renderLibraryTable(records) {
       const latestWork = r.data?.workExperience?.["1"] || {};
       const workYears = calcWorkYears(r.data?.workExperience || {});
       const importedDate = formatDateFromEpoch(r.createdAt || r.created_at || "");
+      const checked = selectedLibraryIds.has(String(r.id)) ? "checked" : "";
       return `<tr>
+        <td><input type="checkbox" class="library-row-check" data-id="${r.id}" ${checked} /></td>
         <td>${b.name || "-"}</td>
         <td>${b.gender || "-"}</td>
         <td>${b.age || "-"}</td>
@@ -429,13 +576,24 @@ function renderLibraryTable(records) {
     })
     .join("");
 
+  $$(".library-row-check").forEach((input) => {
+    input.addEventListener("change", () => {
+      const id = String(input.dataset.id || "").trim();
+      if (!id) return;
+      if (input.checked) selectedLibraryIds.add(id);
+      else selectedLibraryIds.delete(id);
+      syncLibrarySelectAllState(records);
+      updateLibraryBulkDeleteState();
+    });
+  });
+
   $$(".library-detail-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const id = btn.dataset.id;
       const rec = libraryRecords.find((x) => x.id === id);
       if (!rec) return;
       resumeDetailBackTarget = "library";
-      renderResumeDetailPage(rec);
+      await renderResumeDetailPage(rec);
       jumpToStandalonePage("resumeDetail");
     });
   });
@@ -448,12 +606,15 @@ function renderLibraryTable(records) {
       if (!id) return;
       try {
         await invoke("delete_resume_record", { id });
+        selectedLibraryIds.delete(String(id));
         await refreshLibraryAndStats();
       } catch (e) {
         alert(String(e));
       }
     });
   });
+  syncLibrarySelectAllState(records);
+  updateLibraryBulkDeleteState();
 }
 
 function formatDateFromEpoch(v) {
@@ -465,6 +626,16 @@ function formatDateFromEpoch(v) {
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+/** JD 筛选耗时展示（毫秒 → 中文） */
+function formatJdFilterElapsed(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "—";
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)} 秒`;
+  const m = Math.floor(s / 60);
+  const rs = Math.round(s - m * 60);
+  return `${m} 分 ${rs} 秒`;
 }
 
 function parsePeriodStart(period) {
@@ -529,7 +700,64 @@ function escapeHtml(v) {
     .replaceAll("'", "&#39;");
 }
 
-function renderResumeDetailPage(rec) {
+function formatJdScreeningIndexHtml(idx) {
+  if (idx == null) {
+    return '<p class="muted">暂无解析阶段生成的 JD 筛选索引（请先完成简历解析入库，或索引文件已缺失）。</p>';
+  }
+  const summary = String(idx.summaryForJd ?? "").trim();
+  const skills = idx.skillTags ?? [];
+  const roles = idx.roleTags ?? [];
+  const domains = idx.domainTags ?? [];
+  const workBullets = String(idx.workBullets ?? "").trim();
+  const projectBullets = String(idx.projectBullets ?? "").trim();
+
+  const hasTags = (arr) => Array.isArray(arr) && arr.some((s) => String(s).trim());
+  if (
+    !summary &&
+    !hasTags(skills) &&
+    !hasTags(roles) &&
+    !hasTags(domains) &&
+    !workBullets &&
+    !projectBullets
+  ) {
+    return '<p class="muted">索引存在但各字段为空（可能为旧版解析结果）。</p>';
+  }
+
+  const tagRow = (label, arr) => {
+    if (!hasTags(arr)) return "";
+    const chips = arr
+      .map((t) => String(t).trim())
+      .filter(Boolean)
+      .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
+      .join("");
+    return `<div class="detail-item" style="grid-column: 1 / -1"><span class="detail-k">${escapeHtml(label)}</span><div class="tags detail-v">${chips}</div></div>`;
+  };
+
+  const bulletBlock = (label, text) => {
+    if (!text) return "";
+    return `<section style="margin-top:0.75rem"><h3 class="muted" style="font-size:0.95em;margin:0 0 0.35rem">${escapeHtml(
+      label
+    )}</h3><div class="jd-summary-pre">${escapeHtml(text)}</div></section>`;
+  };
+
+  const summaryBlock = summary
+    ? `<section><h3 class="muted" style="font-size:0.95em;margin:0 0 0.35rem">职业摘要</h3><p style="margin:0;line-height:1.55;white-space:pre-wrap">${escapeHtml(
+        summary
+      )}</p></section>`
+    : "";
+
+  const tagRows = [tagRow("技能标签", skills), tagRow("岗位标签", roles), tagRow("领域标签", domains)].join("");
+  const gridBlock = tagRows.trim()
+    ? `<div class="detail-grid" style="margin-top:0.75rem">${tagRows}</div>`
+    : "";
+
+  return `${summaryBlock}
+    ${gridBlock}
+    ${bulletBlock("工作要点", workBullets)}
+    ${bulletBlock("项目要点", projectBullets)}`.trim();
+}
+
+async function renderResumeDetailPage(rec) {
   if (!resumeDetailContent || !resumeDetailBasic || !resumeDetailWorkBody || !resumeDetailProjectBody) return;
 
   const b = rec?.data?.basicInfo || {};
@@ -599,6 +827,23 @@ function renderResumeDetailPage(rec) {
       </tr>`)
       .join("");
   }
+
+  if (resumeDetailJdSummary) {
+    resumeDetailJdSummary.innerHTML = '<p class="muted">加载中…</p>';
+    const id = String(rec?.id || "").trim();
+    if (!invokeFn) {
+      resumeDetailJdSummary.innerHTML = '<p class="muted">当前环境无法调用后端，无法加载 JD 筛选索引。</p>';
+    } else if (!id) {
+      resumeDetailJdSummary.innerHTML = '<p class="muted">无简历 ID，无法加载 JD 筛选索引。</p>';
+    } else {
+      try {
+        const idx = await invoke("get_jd_screening_index_for_resume", { resumeId: id });
+        resumeDetailJdSummary.innerHTML = formatJdScreeningIndexHtml(idx);
+      } catch (e) {
+        resumeDetailJdSummary.innerHTML = `<p class="muted">加载失败：${escapeHtml(String(e))}</p>`;
+      }
+    }
+  }
 }
 
 function applyLibraryFilters() {
@@ -618,7 +863,8 @@ function applyLibraryFilters() {
     if (skill && !skills.includes(skill)) return false;
     return true;
   });
-
+  const visibleIds = new Set(filteredLibraryRecords.map((r) => String(r.id)));
+  selectedLibraryIds = new Set(Array.from(selectedLibraryIds).filter((id) => visibleIds.has(id)));
   renderLibraryTable(filteredLibraryRecords);
 }
 
@@ -688,6 +934,8 @@ function updateStats() {
 async function refreshLibraryAndStats() {
   libraryRecords = await invoke("list_resume_library");
   filteredLibraryRecords = [...libraryRecords];
+  const validIds = new Set(libraryRecords.map((r) => String(r.id)));
+  selectedLibraryIds = new Set(Array.from(selectedLibraryIds).filter((id) => validIds.has(id)));
   renderLibraryTable(filteredLibraryRecords);
   renderRecent(libraryRecords);
   updateStats();
@@ -825,7 +1073,18 @@ function cleanInline(v) {
   return String(v ?? "").replace(/\s+/g, " ").trim();
 }
 
+function getTemplateExportOptions() {
+  return {
+    includeName: Boolean($("tplName")?.checked),
+    includeGender: Boolean($("tplGender")?.checked),
+    includeAge: Boolean($("tplAge")?.checked),
+    includeContact: Boolean($("tplContact")?.checked),
+    includeSkills: Boolean($("tplSkill")?.checked),
+  };
+}
+
 function buildTemplateBlock(src) {
+  const options = getTemplateExportOptions();
   const b = src.basicInfo || {};
   const workRows = Object.keys(src.workExperience || {})
     .sort((a, b) => Number(a) - Number(b))
@@ -836,11 +1095,15 @@ function buildTemplateBlock(src) {
     .map((k) => src.projectExperience?.[k] || {})
     .filter((x) => x.projectName || x.projectDescription || x.projectAchievements);
   const lines = [];
-  lines.push(`# ${cleanInline(b.name) || "候选人姓名"}`);
-  lines.push("## 基础信息");
-  lines.push(`- 性别：${cleanInline(b.gender) || "-"}`);
-  lines.push(`- 年龄：${cleanInline(b.age) || "-"}`);
-  lines.push(`- 联系方式：${cleanInline(b.contact) || "-"}`);
+  lines.push(`# ${options.includeName ? (cleanInline(b.name) || "候选人姓名") : "候选人姓名"}`);
+  const basicLines = [];
+  if (options.includeGender) basicLines.push(`- 性别：${cleanInline(b.gender) || "-"}`);
+  if (options.includeAge) basicLines.push(`- 年龄：${cleanInline(b.age) || "-"}`);
+  if (options.includeContact) basicLines.push(`- 联系方式：${cleanInline(b.contact) || "-"}`);
+  if (basicLines.length) {
+    lines.push("## 基础信息");
+    lines.push(...basicLines);
+  }
 
   const eduRows = Array.isArray(b.education) ? b.education.filter((e) => e?.school || e?.degree || e?.major || e?.period || e?.graduationDate) : [];
   if (eduRows.length) {
@@ -851,7 +1114,7 @@ function buildTemplateBlock(src) {
     });
   }
 
-  if ($("tplSkill")?.checked && Array.isArray(b.skills) && b.skills.length) {
+  if (options.includeSkills && Array.isArray(b.skills) && b.skills.length) {
     lines.push("## 技能");
     lines.push(`- ${(b.skills || []).map((s) => cleanInline(s)).filter(Boolean).join(" / ")}`);
   }
@@ -1017,7 +1280,7 @@ function renderJdRanking(rows) {
     .join("");
 
   $$(".jd-detail-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const idx = Number(btn.dataset.idx);
       if (!Number.isFinite(idx)) return;
       const row = rows[idx];
@@ -1027,7 +1290,7 @@ function renderJdRanking(rows) {
         return;
       }
       resumeDetailBackTarget = "jd";
-      renderResumeDetailPage(rec);
+      await renderResumeDetailPage(rec);
       jumpToStandalonePage("resumeDetail");
     });
   });
@@ -1205,13 +1468,24 @@ btnParse.addEventListener("click", async () => {
     setBusy(true);
     const prov = (appSettings.llm_provider || "").toLowerCase();
     const isLm = prov === "lmstudio" || prov === "lm-studio" || prov === "lm_studio";
-    const missingBase = !isLm && !appSettings.llama_cli_path.trim();
+    const isDeep = prov === "deepseek";
+    const isDash = prov === "dashscope" || prov === "qwen";
+    const isVolc =
+      prov === "doubao" || prov === "ark" || prov === "volcengine" || prov === "volc";
+    const missingBase =
+      !isLm && !isDeep && !isDash && !isVolc && !appSettings.llama_cli_path.trim();
     const missingModel = !appSettings.model_path.trim();
     if (missingBase || missingModel) {
       alert(
-        isLm
-          ? "请先在项目根目录 app-config.json 中配置 modelPath（LM Studio 下 llamaCliPath 可留空，默认 http://127.0.0.1:1234/v1）"
-          : "请先在项目根目录 app-config.json 中配置 llamaCliPath 和 modelPath"
+        isDash
+          ? "请先在左侧「AI 配置」或 app-config.json 中配置：llmProvider 为 dashscope 或 qwen，modelPath 填控制台中的模型名（如 qwen3.5-flash-2026-02-23）；llmApiKey 或环境变量 DASHSCOPE_API_KEY；llamaCliPath 可留空（默认北京 compatible-mode）。国际区请在 llamaCliPath 填写官方国际 compatible-mode 地址。"
+          : isDeep
+            ? "请先在左侧「AI 配置」或 app-config.json 中配置：llmProvider 为 deepseek，modelPath 为 deepseek-v4-flash（或你的模型名）；llamaCliPath 可留空（默认官方 https://api.deepseek.com）；API Key 填 llmApiKey 或设置环境变量 DEEPSEEK_API_KEY。"
+            : isVolc
+              ? "请先在左侧「AI 配置」或 app-config.json 中配置：llmProvider 为 doubao（或 ark / volcengine），modelPath 填方舟模型名（如 doubao-seed-2-0-mini-260428）；llmApiKey 或环境变量 ARK_API_KEY；llamaCliPath 可留空（默认 https://ark.cn-beijing.volces.com/api/v3）。"
+            : isLm
+              ? "请先在左侧「AI 配置」或 app-config.json 中配置 modelPath（LM Studio 下 llamaCliPath 可留空，默认 http://127.0.0.1:1234/v1）"
+              : "请先在左侧「AI 配置」或 app-config.json 中配置 llamaCliPath 和 modelPath"
       );
       return;
     }
@@ -1223,58 +1497,115 @@ btnParse.addEventListener("click", async () => {
 
     let okCount = 0;
     let failCount = 0;
-    for (const item of importQueue) {
-      if (item.error || !item.text || item.status === "已完成") continue;
-      item.status = "解析中";
-      animateProgressTo(item, 60, 18);
-      const parseStartedAt = Date.now();
-      renderQueueTable();
-      currentFile.textContent = item.filePath;
-
-      // 解析阶段缓慢逼近 95%，避免进度条突然跳变。
-      const parseDriftTimer = setInterval(() => {
-        const p = Number.isFinite(item.progress) ? item.progress : 0;
-        if (p < 95) {
-          item.progress = Math.min(95, Math.round(p) + 1);
-          renderQueueTable();
-          return;
-        }
-        clearInterval(parseDriftTimer);
-      }, 140);
-
-      try {
-        const parsed = await invoke("parse_resume", { text: item.text, settings: settings() });
-        lastResumeObj = parsed;
-
-        const savedRecord = await invoke("save_resume_to_library", {
-          sourceFile: item.filePath || "manual-input",
-          resumeObj: parsed,
-        });
-
-        await invoke("save_parsed_result_json", {
-          sourceFile: item.filePath || "manual-input",
-          resumeId: savedRecord?.id || "",
-          resumeObj: parsed,
-        });
-
-        await refreshLibraryAndStats();
-
-        clearInterval(parseDriftTimer);
-        clearProgressTimer(item);
-        item.status = "已完成";
-        animateProgressTo(item, 100, 10);
-        item.parseElapsedMs = Date.now() - parseStartedAt;
-        okCount += 1;
-      } catch (e) {
-        clearInterval(parseDriftTimer);
-        clearProgressTimer(item);
-        item.error = String(e);
-        item.status = "需修正";
-        animateProgressTo(item, 100, 10);
-        item.parseElapsedMs = Date.now() - parseStartedAt;
-        failCount += 1;
+    
+    // 检查是否开启真正的批处理
+    const useBatchSwitch = $("useBatchSwitch");
+    if (useBatchSwitch && useBatchSwitch.checked) {
+      // 批处理模式下交给后端并发或批量一次性处理
+      for (const item of pending) {
+        item.status = "解析中";
+        animateProgressTo(item, 80, 18);
       }
       renderQueueTable();
+      
+      try {
+        const batchItems = pending.map(x => ({ file_path: x.filePath || "manual-input", text: x.text }));
+        const parseStartedAt = Date.now();
+        const results = await invoke("batch_parse_and_save", { items: batchItems, settings: settings() });
+        
+        for (const res of results) {
+          const item = importQueue.find(x => (x.filePath || "manual-input") === res.file_path);
+          if (item) {
+            clearProgressTimer(item);
+            if (res.success) {
+              item.status = "已完成";
+              animateProgressTo(item, 100, 10);
+              okCount++;
+            } else {
+              item.status = "需修正";
+              item.error = res.error;
+              animateProgressTo(item, 100, 10);
+              failCount++;
+            }
+            item.parseElapsedMs = Date.now() - parseStartedAt;
+          }
+        }
+        await refreshLibraryAndStats();
+        renderQueueTable();
+      } catch (err) {
+        console.error("批处理失败：", err);
+        alert("整个批处理任务失败：" + err);
+        for (const item of pending) {
+           item.status = "解析失败";
+           item.error = String(err);
+        }
+        renderQueueTable();
+        return;
+      }
+    } else {
+      // 旧有串行逻辑
+      for (const item of importQueue) {
+        if (item.error || !item.text || item.status === "已完成") continue;
+        item.status = "解析中";
+        animateProgressTo(item, 60, 18);
+        const parseStartedAt = Date.now();
+        renderQueueTable();
+        currentFile.textContent = item.filePath;
+
+        // 解析阶段缓慢逼近 95%，避免进度条突然跳变。
+        const parseDriftTimer = setInterval(() => {
+          const p = Number.isFinite(item.progress) ? item.progress : 0;
+          if (p < 95) {
+            item.progress = Math.min(95, Math.round(p) + 1);
+            renderQueueTable();
+            return;
+          }
+          clearInterval(parseDriftTimer);
+        }, 140);
+
+        try {
+          const parsed = await invoke("parse_resume", { text: item.text, settings: settings() });
+          lastResumeObj = parsed.resume;
+
+          const savedRecord = await invoke("save_resume_to_library", {
+            sourceFile: item.filePath || "manual-input",
+            resumeObj: parsed.resume,
+          });
+
+          await invoke("save_parsed_result_json", {
+            sourceFile: item.filePath || "manual-input",
+            resumeId: savedRecord?.id || "",
+            resumeObj: parsed.resume,
+            jdScreeningIndex: parsed.jdScreeningIndex,
+          });
+
+          await refreshLibraryAndStats();
+
+          clearInterval(parseDriftTimer);
+          clearProgressTimer(item);
+          item.status = "已完成";
+          animateProgressTo(item, 100, 10);
+          item.parseElapsedMs = Date.now() - parseStartedAt;
+          okCount += 1;
+        } catch (e) {
+          clearInterval(parseDriftTimer);
+          clearProgressTimer(item);
+          item.error = String(e);
+          item.status = "需修正";
+          animateProgressTo(item, 100, 10);
+          item.parseElapsedMs = Date.now() - parseStartedAt;
+          failCount += 1;
+        }
+        renderQueueTable();
+      }
+    }
+
+    if (okCount > 0) {
+      try {
+        await invoke("analyze_resumes_db");
+      } catch (e) {
+        console.warn("ANALYZE parsed_resumes 失败（可忽略）:", e);
+      }
     }
     alert(`批量解析完成：成功 ${okCount}，失败 ${failCount}`);
   } catch (e) {
@@ -1306,8 +1637,41 @@ btnExport?.addEventListener("click", async () => {
 });
 
 btnScore.addEventListener("click", async () => {
+  const jdWrap = $("jdFilterProgressWrap");
+  const jdPhase = $("jdFilterProgressPhase");
+  const jdFrac = $("jdFilterProgressFrac");
+  const jdBar = $("jdFilterProgressBar");
+  const listen = window.__TAURI__?.event?.listen;
+  let unlisten = null;
+  let filterT0 = null;
   try {
     setBusy(true);
+    if (jdWrap) jdWrap.style.display = "block";
+    if (jdPhase) jdPhase.textContent = "准备中…";
+    if (jdFrac) jdFrac.textContent = "—";
+    if (jdBar) {
+      jdBar.style.width = "0%";
+      jdBar.classList.remove("is-error");
+    }
+    if (typeof listen === "function") {
+      unlisten = await listen("jd-filter-progress", (ev) => {
+        const p = ev?.payload != null ? ev.payload : ev;
+        const cur = Number(p?.current ?? 0);
+        const tot = Number(p?.total ?? 0);
+        const msg = p?.message || "";
+        const done = Boolean(p?.done);
+        if (jdPhase) jdPhase.textContent = msg;
+        if (tot > 0) {
+          if (jdFrac) jdFrac.textContent = `${cur} / ${tot}`;
+          const pct = Math.min(100, Math.round((cur / tot) * 100));
+          if (jdBar) jdBar.style.width = `${pct}%`;
+        } else {
+          if (jdFrac) jdFrac.textContent = "…";
+          if (jdBar) jdBar.style.width = "6%";
+        }
+        if (done && jdBar) jdBar.style.width = "100%";
+      });
+    }
     const position = (jdPositionInput?.value || "").trim();
     const jd = jdInput.value.trim();
     if (!jd) {
@@ -1320,13 +1684,24 @@ btnScore.addEventListener("click", async () => {
     }
 
     const limit = Number(jdTopN?.value || 10);
-    const rows = await invoke("jd_filter_by_keywords", { position, jdText: jd, limit });
+    let rerankPool = Number(jdRerankPool?.value);
+    if (!Number.isFinite(rerankPool)) rerankPool = 25;
+    rerankPool = Math.max(1, Math.min(75, Math.round(rerankPool)));
+    filterT0 = Date.now();
+    const rows = await invoke("jd_filter_by_keywords", {
+      position,
+      jdText: jd,
+      limit,
+      rerankPool,
+    });
+    const elapsedMs = Date.now() - filterT0;
+    const timePart = `用时 ${formatJdFilterElapsed(elapsedMs)}`;
 
     if (!rows.length) {
       lastJdMatchCount = 0;
       lastJdRankingRows = [];
       renderTemplateCandidatePicker([]);
-      scoreOut.textContent = "score=- (matched=0/0)";
+      if (scoreOut) scoreOut.textContent = `score=- (matched=0/0) · ${timePart}`;
       renderJdRanking([]);
       updateStats();
       return;
@@ -1337,13 +1712,22 @@ btnScore.addEventListener("click", async () => {
     lastJdMatchCount = rows.length;
     lastJdRankingRows = rows.slice();
     renderTemplateCandidatePicker(getCurrentTemplateRows());
-    scoreOut.textContent = `top=${top.score} | 技${b.skillScore ?? 0} 年${b.yearsScore ?? 0} 学${b.degreeScore ?? 0} 工${b.workScore ?? 0} 项${b.projectScore ?? 0}`;
+    if (scoreOut) {
+      scoreOut.textContent = `top=${top.score} | 技${b.skillScore ?? 0} 年${b.yearsScore ?? 0} 学${b.degreeScore ?? 0} 工${b.workScore ?? 0} 项${b.projectScore ?? 0} · ${timePart}`;
+    }
     renderJdRanking(rows);
     updateStats();
   } catch (e) {
+    if (scoreOut && filterT0 != null) {
+      const elapsedMs = Date.now() - filterT0;
+      scoreOut.textContent = `筛选失败 · 用时 ${formatJdFilterElapsed(elapsedMs)}`;
+    }
     alert(String(e));
   } finally {
+    if (typeof unlisten === "function") unlisten();
     setBusy(false);
+    if (jdWrap) jdWrap.style.display = "none";
+    if (jdBar) jdBar.style.width = "0%";
   }
 });
 
@@ -1365,6 +1749,7 @@ btnClear.addEventListener("click", () => {
 
 setupNav();
 bindQuickActions();
+bindAiSettingsPage();
 bindWord2Pdf();
 if (invokeFn) {
   window.appLog = appLog;
@@ -1379,7 +1764,7 @@ loadSettingsFromFile();
 applyHashRoute();
 window.addEventListener("hashchange", applyHashRoute);
 
-["tplSkill"].forEach((id) => {
+["tplName", "tplGender", "tplAge", "tplContact", "tplSkill"].forEach((id) => {
   $(id)?.addEventListener("change", updateTemplatePreview);
 });
 

@@ -1,6 +1,6 @@
 use crate::errors::AppError;
 use crate::export_pdf;
-use crate::json_resume::resume_data_to_json_resume;
+use crate::json_resume::{resume_data_to_json_resume, PdfExportOptions};
 use crate::schema::ResumeData;
 use crate::storage;
 use std::fs;
@@ -58,7 +58,7 @@ fn ensure_embedded_jsonresume_theme(root: &Path) -> Result<(), AppError> {
   Ok(())
 }
 
-pub fn export_pdf_with_jsonresume(resume: &ResumeData, include_skills: bool, out_path: &str) -> Result<(), AppError> {
+pub fn export_pdf_with_jsonresume(resume: &ResumeData, options: PdfExportOptions, out_path: &str) -> Result<(), AppError> {
   let root = storage::project_root_dir()?;
   let target_path = PathBuf::from(out_path);
   if let Some(parent) = target_path.parent() {
@@ -84,7 +84,7 @@ pub fn export_pdf_with_jsonresume(resume: &ResumeData, include_skills: bool, out
       }
       let tmp_resume = tmp_dir.join(format!("resume-{}.json", now_millis()));
       let tmp_output = tmp_dir.join(format!("resume-{}.pdf", now_millis()));
-      let resume_json = resume_data_to_json_resume(resume, include_skills);
+      let resume_json = resume_data_to_json_resume(resume, options);
       fs::write(&tmp_resume, serde_json::to_string_pretty(&resume_json)?)?;
 
       let tmp_resume_str = tmp_resume.to_string_lossy().to_string();
@@ -135,7 +135,7 @@ pub fn export_pdf_with_jsonresume(resume: &ResumeData, include_skills: bool, out
     log::info!("json_resume: 未检测到 node_modules/resume 与 jsonresume-theme-local，使用内置文本 PDF");
   }
 
-  let content = export_pdf::resume_data_to_plain_pdf_content(resume, include_skills);
+  let content = export_pdf::resume_data_to_plain_pdf_content(resume, options);
   export_pdf::write_resume_pdf(&content, out_path)?;
   Ok(())
 }

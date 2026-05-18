@@ -1,5 +1,28 @@
 use crate::schema::ResumeData;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PdfExportOptions {
+  pub include_name: bool,
+  pub include_gender: bool,
+  pub include_age: bool,
+  pub include_contact: bool,
+  pub include_skills: bool,
+}
+
+impl Default for PdfExportOptions {
+  fn default() -> Self {
+    Self {
+      include_name: true,
+      include_gender: true,
+      include_age: true,
+      include_contact: true,
+      include_skills: true,
+    }
+  }
+}
 
 fn clean_inline(v: &str) -> String {
   v.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
@@ -10,7 +33,7 @@ fn safe(v: &str) -> String {
   if s.is_empty() { "-".to_string() } else { s }
 }
 
-pub fn resume_data_to_json_resume(resume: &ResumeData, include_skills: bool) -> Value {
+pub fn resume_data_to_json_resume(resume: &ResumeData, options: PdfExportOptions) -> Value {
   let b = &resume.basic_info;
 
   let work = {
@@ -76,7 +99,7 @@ pub fn resume_data_to_json_resume(resume: &ResumeData, include_skills: bool) -> 
       .collect::<Vec<_>>()
   };
 
-  let skills = if include_skills {
+  let skills = if options.include_skills {
     let list = b
       .skills
       .iter()
@@ -91,13 +114,13 @@ pub fn resume_data_to_json_resume(resume: &ResumeData, include_skills: bool) -> 
 
   json!({
     "basics": {
-      "name": safe(&b.name),
+      "name": if options.include_name { safe(&b.name) } else { "".to_string() },
       "label": "",
-      "xGender": safe(&b.gender),
-      "xAge": safe(&b.age),
+      "xGender": if options.include_gender { safe(&b.gender) } else { "".to_string() },
+      "xAge": if options.include_age { safe(&b.age) } else { "".to_string() },
       "image": "",
       "email": "",
-      "phone": safe(&b.contact),
+      "phone": if options.include_contact { safe(&b.contact) } else { "".to_string() },
       "url": "",
       "summary": "",
       "location": {

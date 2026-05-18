@@ -129,6 +129,38 @@ fn merge_description(a: &str, b: &str) -> String {
   format!("{}\n{}", a, b)
 }
 
+/// 去掉姓名末尾误粘的简历表头词（模型常把「性别」等与姓名写进同一字符串）。
+fn normalize_display_name(raw: &str) -> String {
+  let mut s = raw.trim().to_string();
+  if s.is_empty() {
+    return s;
+  }
+  const SUFFIXES: &[&str] = &[
+    " 性别", "性别", " Sex", " Gender",
+    " 男", " 女",
+    " Male", " Female",
+    " 年龄", " 年纪",
+    " 姓名", " 名字", " Name",
+    " 电话", " 手机", " 联系方式", " 邮箱",
+  ];
+  let mut changed = true;
+  while changed {
+    changed = false;
+    let t = s.trim_end();
+    for suf in SUFFIXES {
+      if t.ends_with(suf) {
+        s = t[..t.len() - suf.len()].trim_end().to_string();
+        changed = true;
+        break;
+      }
+    }
+  }
+  if let Ok(re) = Regex::new(r"\s+") {
+    s = re.replace_all(s.trim(), " ").to_string();
+  }
+  s
+}
+
 fn normalize_basic(mut b: BasicInfo) -> BasicInfo {
   if b.education.is_empty() {
     b.education.push(EducationItem::default());
@@ -142,7 +174,7 @@ fn normalize_basic(mut b: BasicInfo) -> BasicInfo {
       };
     }
   }
-  b.name = b.name.trim().to_string();
+  b.name = normalize_display_name(&b.name);
   b.age = normalize_age(&b.age);
   b.contact = b.contact.trim().to_string();
   b.gender = b.gender.trim().to_string();

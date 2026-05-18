@@ -87,6 +87,12 @@ body{
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .grid-3{display:grid;grid-template-columns:1.2fr 1fr .9fr;gap:10px}
 .stack{display:flex;flex-direction:column;gap:8px}
+.ai-settings-form .ai-field-row{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:10px}
+.ai-settings-form .ai-field-row>label{min-width:160px;color:var(--sub);font-size:13px}
+.ai-settings-form .ai-field-row input[type=text],
+.ai-settings-form .ai-field-row input[type=password],
+.ai-settings-form .ai-field-row input[type=number],
+.ai-settings-form .ai-field-row select{flex:1;min-width:240px;max-width:640px}
 .filters{
   display:grid;
   grid-template-columns:1.3fr .8fr .8fr 1fr auto auto;
@@ -229,6 +235,19 @@ button:disabled{opacity:.6;cursor:not-allowed;transform:none}
 .detail-k{font-size:12px;color:var(--sub)}
 .detail-v{font-size:14px;color:var(--text);word-break:break-word}
 .detail-table td{word-break:break-word}
+
+.jd-summary-pre{
+  margin:0;
+  font-family:inherit;
+  font-size:13px;
+  line-height:1.55;
+  white-space:pre-wrap;
+  word-break:break-word;
+  background:#f8fbff;
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:10px 12px;
+}
 
 @media (max-width: 1000px){
   .layout{grid-template-columns:1fr;min-width:0;height:auto}

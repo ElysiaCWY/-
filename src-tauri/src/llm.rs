@@ -1,5 +1,5 @@
 use crate::errors::AppError;
-use crate::schema::{AppSettings, ProjectItem, ResumeData, WorkItem};
+use crate::schema::{AppSettings, JdScreeningIndex, ProjectItem, ResumeData, ResumeParseOutput, WorkItem};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -14,10 +14,23 @@ const RESUME_PARSE_NUM_CTX: u32 = 65536;
 const OLLAMA_REQUEST_TIMEOUT_SECS: u64 = 180;
 /// 单次生成最大 token 数，避免使用默认较小上限导致 JSON 被截断。
 const OLLAMA_NUM_PREDICT: i32 = 8192;
-/// 单阶段（stage1/stage2）最大尝试次数：首次 + 重试。
+/// OpenAI 兼容 **云端**（DeepSeek / DashScope / 火山方舟）简历解析：单轮含 `resume` + `jdScreeningIndex`，输出较长；可用 `cloudMaxOutputTokens` 再收紧以换时间。
+const CLOUD_RESUME_PARSE_MAX_TOKENS: u32 = 24576;
+/// 云端 JD 相关单次补全（结构化提取、打分等）略高于本地默认。
+const CLOUD_JD_MAX_TOKENS: u32 = 8192;
+/// 单阶段简历解析请求最大尝试次数：首次 + 重试。
 const OLLAMA_MAX_ATTEMPTS: usize = 2;
 /// 重试前等待毫秒。
 const OLLAMA_RETRY_DELAY_MS: u64 = 1200;
+
+fn request_timeout_secs_for_label(label: &str) -> u64 {
+  // JD 筛选会在一次请求中触发多次模型调用，缩短单次超时可显著降低“卡住”体感。
+  if label.starts_with("jd_") {
+    45
+  } else {
+    OLLAMA_REQUEST_TIMEOUT_SECS
+  }
+}
 
 /// 构建时嵌入仓库根目录的 `解析结果模板.json`；运行时同目录若存在同名文件则优先读取。
 const EMBEDDED_RESUME_TEMPLATE_JSON: &str =
@@ -35,6 +48,11 @@ pub struct LlmSettings {
   pub temperature: f32,
   #[serde(default = "default_llm_provider", alias = "llmProvider")]
   pub llm_provider: String,
+  #[serde(default, alias = "llmApiKey")]
+  pub llm_api_key: String,
+  /// 云端 `max_tokens` 上限；见 `AppSettings::cloud_max_output_tokens`。
+  #[serde(default, alias = "cloudMaxOutputTokens")]
+  pub cloud_max_output_tokens: Option<u32>,
 }
 
 impl From<&AppSettings> for LlmSettings {
@@ -45,6 +63,8 @@ impl From<&AppSettings> for LlmSettings {
       threads: s.threads,
       temperature: s.temperature,
       llm_provider: s.llm_provider.clone(),
+      llm_api_key: s.llm_api_key.clone(),
+      cloud_max_output_tokens: s.cloud_max_output_tokens,
     }
   }
 }
@@ -64,11 +84,135 @@ fn provider_is_lmstudio(raw: &str) -> bool {
   )
 }
 
-pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<ResumeData, AppError> {
+fn provider_is_deepseek(raw: &str) -> bool {
+  raw.trim().to_ascii_lowercase() == "deepseek"
+}
+
+fn provider_is_dashscope(raw: &str) -> bool {
+  matches!(
+    raw.trim().to_ascii_lowercase().as_str(),
+    "dashscope" | "qwen"
+  )
+}
+
+/// 火山引擎方舟（豆包等）OpenAI 兼容接口，`POST {base}/chat/completions`。
+fn provider_is_volc_ark(raw: &str) -> bool {
+  matches!(
+    raw.trim().to_ascii_lowercase().as_str(),
+    "doubao" | "ark" | "volcengine" | "volc"
+  )
+}
+
+fn normalize_deepseek_base_url(input: &str) -> String {
+  let raw = input.trim();
+  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
+    "https://api.deepseek.com".to_string()
+  } else if raw.starts_with("http://") || raw.starts_with("https://") {
+    raw.trim_end_matches('/').to_string()
+  } else {
+    format!("https://{}", raw.trim_end_matches('/'))
+  };
+  let base = base.trim_end_matches('/');
+  if base.to_ascii_lowercase().ends_with("/v1") {
+    base.to_string()
+  } else {
+    format!("{}/v1", base)
+  }
+}
+
+fn deepseek_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+  let from_config = settings.llm_api_key.trim();
+  if !from_config.is_empty() {
+    return Ok(from_config.to_string());
+  }
+  let from_env = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+  let from_env = from_env.trim();
+  if !from_env.is_empty() {
+    return Ok(from_env.to_string());
+  }
+  Err(AppError::msg(
+    "DeepSeek：请在 app-config.json 中配置 llmApiKey，或设置环境变量 DEEPSEEK_API_KEY",
+  ))
+}
+
+fn normalize_dashscope_base_url(input: &str) -> String {
+  let raw = input.trim();
+  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
+    "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()
+  } else if raw.starts_with("http://") || raw.starts_with("https://") {
+    raw.trim_end_matches('/').to_string()
+  } else {
+    format!("https://{}", raw.trim_end_matches('/'))
+  };
+  let base = base.trim_end_matches('/');
+  let lower = base.to_ascii_lowercase();
+  if lower.ends_with("/v1") {
+    return base.to_string();
+  }
+  if lower.ends_with("/compatible-mode") {
+    return format!("{}/v1", base);
+  }
+  format!("{}/compatible-mode/v1", base)
+}
+
+fn dashscope_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+  let from_config = settings.llm_api_key.trim();
+  if !from_config.is_empty() {
+    return Ok(from_config.to_string());
+  }
+  for key in ["DASHSCOPE_API_KEY", "QWEN_API_KEY"] {
+    if let Ok(v) = std::env::var(key) {
+      let v = v.trim();
+      if !v.is_empty() {
+        return Ok(v.to_string());
+      }
+    }
+  }
+  Err(AppError::msg(
+    "DashScope：请在 app-config.json 中配置 llmApiKey，或设置环境变量 DASHSCOPE_API_KEY",
+  ))
+}
+
+fn normalize_volc_ark_base_url(input: &str) -> String {
+  let raw = input.trim();
+  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
+    "https://ark.cn-beijing.volces.com/api/v3".to_string()
+  } else if raw.starts_with("http://") || raw.starts_with("https://") {
+    raw.trim_end_matches('/').to_string()
+  } else {
+    format!("https://{}", raw.trim_end_matches('/'))
+  };
+  let base = base.trim_end_matches('/');
+  if base.to_ascii_lowercase().ends_with("/api/v3") {
+    base.to_string()
+  } else {
+    format!("{}/api/v3", base)
+  }
+}
+
+fn volc_ark_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+  let from_config = settings.llm_api_key.trim();
+  if !from_config.is_empty() {
+    return Ok(from_config.to_string());
+  }
+  for key in ["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"] {
+    if let Ok(v) = std::env::var(key) {
+      let v = v.trim();
+      if !v.is_empty() {
+        return Ok(v.to_string());
+      }
+    }
+  }
+  Err(AppError::msg(
+    "火山方舟：请在 app-config.json 中配置 llmApiKey，或设置环境变量 ARK_API_KEY",
+  ))
+}
+
+pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<ResumeParseOutput, AppError> {
   if settings.model_path.trim().is_empty() {
     resume_parse_log!(error, "resume_parse: 中止，未配置模型名");
     return Err(AppError::msg(
-      "请在 app-config.json 的 modelPath 中填写模型名（Ollama 如 qwen2.5:3b；LM Studio 与左侧已选模型 ID 一致）",
+      "请在 app-config.json 的 modelPath 中填写模型名（Ollama 如 qwen2.5:3b；LM Studio 与所选模型 ID 一致；DeepSeek / DashScope 填控制台中的模型 ID；火山方舟如 doubao-seed-2-0-mini-260428）",
     ));
   }
 
@@ -79,7 +223,23 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
     ));
   }
 
-  let base_log = if provider_is_lmstudio(&settings.llm_provider) {
+  if provider_is_deepseek(&settings.llm_provider) {
+    let _ = deepseek_api_key(settings)?;
+  }
+  if provider_is_dashscope(&settings.llm_provider) {
+    let _ = dashscope_api_key(settings)?;
+  }
+  if provider_is_volc_ark(&settings.llm_provider) {
+    let _ = volc_ark_api_key(settings)?;
+  }
+
+  let base_log = if provider_is_deepseek(&settings.llm_provider) {
+    normalize_deepseek_base_url(&settings.llama_cli_path)
+  } else if provider_is_dashscope(&settings.llm_provider) {
+    normalize_dashscope_base_url(&settings.llama_cli_path)
+  } else if provider_is_volc_ark(&settings.llm_provider) {
+    normalize_volc_ark_base_url(&settings.llama_cli_path)
+  } else if provider_is_lmstudio(&settings.llm_provider) {
     normalize_lmstudio_base_url(&settings.llama_cli_path)
   } else {
     normalize_ollama_base_url(&settings.llama_cli_path)
@@ -100,171 +260,224 @@ pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<Resum
   let tpl_content = load_resume_template_content()?;
   let tpl_for_prompt = template_for_prompt(&tpl_content);
 
-  // 第一阶段：先抽取稳定结构（公司/职位/时间段/项目名称等骨架信息）
-  let stage1_prompt = build_stage1_prompt(&tpl_for_prompt, text);
+  let (masked_text, priv_map) = crate::privacy_mask::mask_sensitive_segments_single(text);
+  let prompt = build_single_stage_resume_prompt(&tpl_for_prompt, &masked_text, !priv_map.is_empty());
   resume_parse_log!(
     debug,
-    "resume_parse: stage1_prompt_chars={}",
-    stage1_prompt.chars().count()
+    "resume_parse: single_stage_prompt_chars={}",
+    prompt.chars().count()
   );
-  let stage1_json = run_ollama_json("stage1", &stage1_prompt, settings)?;
+
+  let raw_json = run_ollama_json("resume_parse", &prompt, settings)?;
   resume_parse_log!(
     debug,
-    "resume_parse: stage1 模型原始 JSON 长度={}",
-    stage1_json.chars().count()
+    "resume_parse: single_stage 模型原始 JSON 长度={}",
+    raw_json.chars().count()
   );
-  let stage1_data = parse_resume_data_flexible(&stage1_json).map_err(|e| {
+
+  let raw_json = crate::privacy_mask::unmask_sensitive_segments(&raw_json, &priv_map);
+  let out = parse_resume_and_index_from_model_json(&raw_json, text).map_err(|e| {
     resume_parse_log!(
       error,
-      "resume_parse: stage1 反序列化失败 err={} json_prefix={}",
+      "resume_parse: 解析模型 JSON 失败 err={} json_prefix={}",
       e,
-      clip(&stage1_json, 800)
+      clip(&raw_json, 800)
     );
     AppError::msg(format!(
-      "第一阶段反序列化失败：{}\nJSON原文：{}",
+      "简历解析失败：{}\nJSON原文：{}",
       e,
-      clip(&stage1_json, 1200)
+      clip(&raw_json, 1200)
     ))
   })?;
+
   resume_parse_log!(
     info,
-    "resume_parse: stage1 成功 work_entries={} project_entries={}",
-    stage1_data.work_experience.len(),
-    stage1_data.project_experience.len()
+    "resume_parse: single_stage 成功 work_entries={} project_entries={}",
+    out.resume.work_experience.len(),
+    out.resume.project_experience.len()
   );
 
-  // 第二阶段：基于第一阶段骨架补全描述细节，提升内容质量
-  let stage1_seed = serde_json::to_string_pretty(&stage1_data)
-    .unwrap_or_else(|_| stage1_json.clone());
-  let stage2_prompt = build_stage2_prompt(&tpl_for_prompt, text, &stage1_seed);
-  resume_parse_log!(
-    debug,
-    "resume_parse: stage2_prompt_chars={} stage1_seed_chars={}",
-    stage2_prompt.chars().count(),
-    stage1_seed.chars().count()
-  );
-
-  let final_data = match run_ollama_json("stage2", &stage2_prompt, settings).and_then(|json| {
-    let n = json.chars().count();
-    parse_resume_data_flexible(&json).map_err(|e| {
-      resume_parse_log!(
-        warn,
-        "resume_parse: stage2 JSON 反序列化失败 len={} err={} json_prefix={}",
-        n,
-        e,
-        clip(&json, 600)
-      );
-      AppError::msg(e)
-    })
-  }) {
-    Ok(v) => {
-      resume_parse_log!(
-        info,
-        "resume_parse: stage2 成功 work_entries={} project_entries={}",
-        v.work_experience.len(),
-        v.project_experience.len()
-      );
-      v
-    }
-    Err(e) => {
-      resume_parse_log!(
-        warn,
-        "resume_parse: stage2 未采用，回退 stage1 结果。原因: {}",
-        e
-      );
-      stage1_data.clone()
-    }
-  };
-
-  // 防止第二阶段“补全”时把第一阶段已抽到的项目/工作经历条目变少。
-  let final_data = preserve_project_items(&stage1_data, final_data);
-  let final_data = preserve_work_items(&stage1_data, final_data);
-  let final_data = preserve_basic_and_details(&stage1_data, final_data);
-
-  let grounded = filter_resume_by_source_text(final_data, text);
   resume_parse_log!(
     info,
     "resume_parse: 完成（过滤后）name={:?} work_entries={} project_entries={}",
-    grounded.basic_info.name,
-    grounded.work_experience.len(),
-    grounded.project_experience.len()
+    out.resume.basic_info.name,
+    out.resume.work_experience.len(),
+    out.resume.project_experience.len()
   );
-  Ok(grounded)
+  Ok(out)
 }
 
-fn build_stage1_prompt(tpl: &str, text: &str) -> String {
-  format!(
-    r#"解析简历（第一阶段：结构抽取），只输出 JSON。
+/// 模型应返回 `{{ "resume": {{...}}, "jdScreeningIndex": {{...}} }}`；兼容仅返回简历根对象（无索引时程序补全）。
+fn parse_resume_and_index_from_model_json(raw: &str, source_text: &str) -> Result<ResumeParseOutput, String> {
+  let raw_clean = sanitize_json_control_chars_inside_strings(raw.trim());
+  let v: Value = serde_json::from_str(&raw_clean).map_err(|e| e.to_string())?;
+  let obj = v.as_object().ok_or_else(|| "模型输出不是 JSON 对象".to_string())?;
 
-下面是字段结构模板（JSON）：
+  let (resume_json_str, mut jd_index) = if obj.contains_key("resume") && obj.contains_key("jdScreeningIndex") {
+    let resume_val = obj.get("resume").cloned().ok_or_else(|| "缺少 resume".to_string())?;
+    let resume_str = serde_json::to_string(&resume_val).map_err(|e| e.to_string())?;
+    let idx_val = obj.get("jdScreeningIndex").cloned().unwrap_or(Value::Object(Map::new()));
+    let jd: JdScreeningIndex = serde_json::from_value(idx_val).unwrap_or_default();
+    (resume_str, jd)
+  } else if obj.contains_key("basicInfo") {
+    (raw_clean, JdScreeningIndex::default())
+  } else {
+    return Err("模型输出须包含 resume 与 jdScreeningIndex，或为旧版单对象简历（含 basicInfo）".to_string());
+  };
+
+  let resume = parse_resume_data_flexible(&resume_json_str)?;
+  let resume = filter_resume_by_source_text(resume, source_text);
+  jd_index = merge_sparse_jd_index(&resume, jd_index);
+  Ok(ResumeParseOutput {
+    resume,
+    jd_screening_index: jd_index,
+  })
+}
+
+fn merge_sparse_jd_index(data: &ResumeData, mut jd: JdScreeningIndex) -> JdScreeningIndex {
+  let need_fallback = jd.summary_for_jd.trim().is_empty()
+    && jd.skill_tags.is_empty()
+    && jd.work_bullets.trim().is_empty()
+    && jd.project_bullets.trim().is_empty();
+  if need_fallback {
+    return jd_screening_index_from_resume(data);
+  }
+  if jd.skill_tags.is_empty() && !data.basic_info.skills.is_empty() {
+    jd.skill_tags = data
+      .basic_info
+      .skills
+      .iter()
+      .filter(|s| !s.trim().is_empty())
+      .take(20)
+      .cloned()
+      .collect();
+  }
+  jd
+}
+
+fn jd_screening_index_from_resume(data: &ResumeData) -> JdScreeningIndex {
+  let skills: Vec<String> = data
+    .basic_info
+    .skills
+    .iter()
+    .filter(|s| !s.trim().is_empty())
+    .take(20)
+    .cloned()
+    .collect();
+  let work_bullets: String = data
+    .work_experience
+    .values()
+    .take(8)
+    .map(|w| {
+      let d = clip(w.description.trim(), 160);
+      format!("{}｜{}｜{}", w.company.trim(), w.position.trim(), d)
+    })
+    .filter(|s| !s.trim().is_empty() && s != "｜｜")
+    .collect::<Vec<_>>()
+    .join("\n");
+  let project_bullets: String = data
+    .project_experience
+    .values()
+    .take(8)
+    .map(|p| {
+      let d = clip(p.project_description.trim(), 120);
+      let a = clip(p.project_achievements.trim(), 120);
+      format!("{}｜{}｜{}", p.project_name.trim(), d, a)
+    })
+    .filter(|s| !s.trim().is_empty() && s != "｜｜")
+    .collect::<Vec<_>>()
+    .join("\n");
+  let summary_for_jd = format!(
+    "（程序摘要）技能{}项；工作条目{}；项目条目{}。",
+    skills.len(),
+    data.work_experience.len(),
+    data.project_experience.len()
+  );
+  JdScreeningIndex {
+    summary_for_jd,
+    skill_tags: skills,
+    role_tags: Vec::new(),
+    domain_tags: Vec::new(),
+    work_bullets,
+    project_bullets,
+  }
+}
+
+fn build_single_stage_resume_prompt(tpl: &str, text: &str, privacy_masked: bool) -> String {
+  let privacy_block = if privacy_masked {
+    r##"
+
+11. 【隐私占位符】简历原文中部分姓名与联系方式已替换为形如 __RM_PRIV_0000__ 的占位符（与明文对应关系仅保存在本机进程内，不写入模型侧持久化）。你在 JSON 的所有字符串中必须 **原样** 使用这些占位符（含下划线与四位数字），不得改写为真实中文/数字/邮箱；basicInfo.name、basicInfo.contact 及 jdScreeningIndex 中凡对应原文敏感处也必须使用同一占位符，不得编造新的真实隐私。
+"##
+  } else {
+    ""
+  };
+  format!(
+    r#"解析简历（单阶段：完整简历 + JD 筛选索引一次输出），只输出 **一个** JSON 对象。
+
+顶层必须恰好两个字段（不得增删顶层键名）：
+- "resume"：与下方「简历模板」同结构的完整对象（camelCase 字段名）。
+- "jdScreeningIndex"：供后续岗位匹配使用的精简索引，字段固定为：
+```json
+{{
+  "summaryForJd": "200～500 字中文，概括职业主线、年限感、核心技术栈与 2～4 条可核对成果，勿编造",
+  "skillTags": ["最多20个技能关键词，与 resume 中技能/经历可核对"],
+  "roleTags": ["如 后端开发，最多6个"],
+  "domainTags": ["行业或业务域，最多6个"],
+  "workBullets": "换行分隔，每行一条工作要点摘要（公司｜岗位｜要点），每条不超过约80字",
+  "projectBullets": "换行分隔，每行一条项目要点（项目名｜职责｜成果摘要）"
+}}
+```
+
+简历模板（resume 对象须与此一致）：
 ```json
 {tpl}
 ```
 
-要求：
-1. 严格按模板字段输出，不要新增或删除字段。
-2. 工作经历与项目经历要尽量完整枚举，按时间倒序。
-3. 本阶段优先保证结构完整和分段正确，description/projectAchievements 可简写。
-4. 项目经历必须尽可能完整抽取（来自“项目经历/项目经验/项目描述”等章节），不要遗漏条目。每条项目中：projectDescription 侧重背景、职责、技术方案与实现要点；**projectAchievements 必须承载简历里该项目的「项目业绩」「项目成果」「业绩」「效果/指标」等成果类表述**（含量化数据、获奖、业务效果）；若原文把业绩写在项目段落内或单独小标题下，须完整迁入 projectAchievements，勿仅堆在 projectDescription 而留空成果。
-5. basicInfo.skills：除简历中明确列出的技能（如「专业技能」「技术栈」「掌握」等小节）外，必须结合 **工作经历** 的 description 与 **项目经历** 的 projectDescription、projectAchievements 中实际出现或可合理归纳的技术要素进行补充，包括：编程语言、框架、库、数据库与中间件、云平台、工具链、工程实践相关术语等；表述用简短名词短语，去重，与原文表述一致或可核对，不得凭空捏造。
-6. 严禁混入其他候选人的信息；若原文无证据，不得编造。
-7. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
-8. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
+对 resume 对象的要求：
+1. 严格按模板字段输出，不要新增或删除 resume 内字段。
+2. 工作经历与项目经历尽量完整枚举，按时间倒序；不要把多段经历合并成一段。
+3. 每条工作经历 description 写全职责与要点（有原文依据时尽量充实）。
+4. 项目经历完整抽取；projectAchievements 承载业绩/指标/成果类表述。
+5. basicInfo.skills 须结合经历归纳技术名词，去重，不得凭空捏造。
+6. basicInfo.name 仅填姓名或称呼本身，不得拼接表头词（如「性别」「男」「女」「年龄」「电话」等）；这些内容须写入 gender、age、contact 等对应字段。
+7. 严禁混入其他候选人信息。
 
-简历内容：
+对 jdScreeningIndex 的要求：
+8. 所有内容须能在上方简历原文或 resume 对象中找到依据；不得虚构公司/项目/证书。
+9. 仅返回 JSON 对象，不要 markdown 围栏或解释文字。
+10. 必须输出完整、可解析的 JSON，不得中途截断。
+{privacy_block}
+简历原文：
 """{text}""""#,
     tpl = tpl,
-    text = text
-  )
-}
-
-fn build_stage2_prompt(tpl: &str, text: &str, stage1_seed: &str) -> String {
-  format!(
-    r#"解析简历（第二阶段：细节补全），只输出 JSON。
-
-下面是字段结构模板（JSON）：
-```json
-{tpl}
-```
-
-下面是第一阶段结果（结构骨架），请在不破坏结构的前提下补全内容：
-```json
-{seed}
-```
-
-要求：
-1. 保持 workExperience / projectExperience 的条目结构，不要把多段经历合并成一段。
-2. 可补充 description / projectDescription / projectAchievements 的细节，但不要编造不存在的公司/项目。补全 projectAchievements 时，**优先从原文「项目业绩」「项目成果」「业绩」「效果」等小节或项目块内的成果描述完整迁入**，与 projectDescription 分工：描述讲“做了什么”，成果讲“效果与业绩”。
-3. projectExperience 的条目数量不得少于第一阶段，不能因为补全而删减已有项目。
-4. 同步检查并完善 basicInfo.skills：在第一阶段已有技能基础上，根据本阶段补全后的 **工作经历、项目经历** 全文，补充其中出现或可归纳的技术技能（须能在原简历中核对，表述简短、去重）；若经历中无新增技术信息则保持原 skills。
-5. 严禁混入其他候选人的信息；只有简历原文可找到依据的经历才能保留。
-6. 仅返回 JSON 对象，不要返回 markdown 或解释文字。
-7. 必须输出完整、可解析的 JSON，不得中途截断或提前结束。
-
-简历内容：
-"""{text}""""#,
-    tpl = tpl,
-    seed = stage1_seed,
-    text = text
+    text = text,
+    privacy_block = privacy_block
   )
 }
 
 fn llm_log_prefix(label: &str) -> &'static str {
-  if label == "stage1" || label == "stage2" {
+  if label == "resume_parse" {
     "resume_parse"
   } else {
     "app_llm"
   }
 }
 
-/// 统一入口：Ollama `/api/generate` 或 LM Studio OpenAI 兼容 `POST .../chat/completions`。
+/// 统一入口：Ollama、LM Studio、DeepSeek、DashScope、火山方舟（OpenAI 兼容 `.../chat/completions`）。
 pub fn complete_json_prompt(
   label: &str,
   prompt: &str,
   settings: &LlmSettings,
   params: JsonPromptParams,
 ) -> Result<String, AppError> {
-  if provider_is_lmstudio(&settings.llm_provider) {
+  if provider_is_deepseek(&settings.llm_provider) {
+    run_deepseek_json(label, prompt, settings, params)
+  } else if provider_is_dashscope(&settings.llm_provider) {
+    run_dashscope_json(label, prompt, settings, params)
+  } else if provider_is_volc_ark(&settings.llm_provider) {
+    run_volc_ark_json(label, prompt, settings, params)
+  } else if provider_is_lmstudio(&settings.llm_provider) {
     run_lmstudio_json(label, prompt, settings, params)
   } else {
     run_ollama_json_params(label, prompt, settings, params)
@@ -310,6 +523,7 @@ fn run_ollama_json_params(
   });
 
   let np_log = params.ollama_num_predict.unwrap_or(-1);
+  let timeout_secs = request_timeout_secs_for_label(label);
   resume_parse_log!(
     debug,
     "{}: [{}] POST {} prompt_chars={} timeout_s={} max_attempts={} num_predict={}",
@@ -317,7 +531,7 @@ fn run_ollama_json_params(
     label,
     endpoint,
     prompt.chars().count(),
-    OLLAMA_REQUEST_TIMEOUT_SECS,
+    timeout_secs,
     OLLAMA_MAX_ATTEMPTS,
     np_log
   );
@@ -326,7 +540,7 @@ fn run_ollama_json_params(
   for attempt in 1..=OLLAMA_MAX_ATTEMPTS {
     let result = ureq::post(&endpoint)
       .set("Content-Type", "application/json")
-      .timeout(Duration::from_secs(OLLAMA_REQUEST_TIMEOUT_SECS))
+      .timeout(Duration::from_secs(timeout_secs))
       .send_json(body.clone());
 
     let resp = match result {
@@ -395,7 +609,7 @@ fn run_ollama_json_params(
       })?;
 
     let extracted = match extract_json_object(raw_text) {
-      Some(v) => v,
+      Some(v) => sanitize_json_control_chars_inside_strings(&v),
       None => {
         let err_text = format!("模型输出中未找到 JSON 对象。原始输出前800字符：{}", clip(raw_text, 800));
         last_err = Some(err_text.clone());
@@ -471,44 +685,132 @@ fn lmstudio_max_tokens(params: &JsonPromptParams) -> u32 {
   n.clamp(256, 32768) as u32
 }
 
+/// 云端 API 的 `max_tokens`：在本地推导值基础上适度抬高（LM Studio 仍走 `lmstudio_max_tokens`）。
+fn openai_compat_max_tokens(
+  vendor: OpenAiCompatVendor,
+  label: &str,
+  params: &JsonPromptParams,
+  cloud_max_output_tokens: Option<u32>,
+) -> u32 {
+  let base = lmstudio_max_tokens(params);
+  let computed = match vendor {
+    OpenAiCompatVendor::LmStudio => base,
+    OpenAiCompatVendor::DeepSeek
+    | OpenAiCompatVendor::DashScope
+    | OpenAiCompatVendor::VolcArk => {
+      if label == "resume_parse" {
+        base.max(CLOUD_RESUME_PARSE_MAX_TOKENS).min(65536)
+      } else if label.starts_with("jd_") {
+        base.max(CLOUD_JD_MAX_TOKENS).min(32768)
+      } else {
+        base.max(8192).min(32768)
+      }
+    }
+  };
+  match (
+    vendor,
+    cloud_max_output_tokens.filter(|&c| c >= 2048).map(|c| c.min(65536)),
+  ) {
+    (
+      OpenAiCompatVendor::DeepSeek | OpenAiCompatVendor::DashScope | OpenAiCompatVendor::VolcArk,
+      Some(cap),
+    ) => computed.min(cap),
+    _ => computed,
+  }
+}
+
+#[derive(Clone, Copy)]
+enum OpenAiCompatVendor {
+  LmStudio,
+  DeepSeek,
+  DashScope,
+  VolcArk,
+}
+
 fn run_lmstudio_json(
   label: &str,
   prompt: &str,
   settings: &LlmSettings,
   params: JsonPromptParams,
 ) -> Result<String, AppError> {
-  let base_url = normalize_lmstudio_base_url(&settings.llama_cli_path);
-  let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-  let max_tokens = lmstudio_max_tokens(&params);
-  let schema_name = if label == "stage1" || label == "stage2" {
-    "resume_parse_schema"
-  } else {
-    "generic_json_schema"
-  };
-  let response_format = if label == "stage1" || label == "stage2" {
-    json!({
-      "type": "json_schema",
-      "json_schema": {
-        "name": schema_name,
-        "strict": true,
-        "schema": resume_json_schema()
-      }
-    })
-  } else {
-    json!({ "type": "json_object" })
-  };
+  run_openai_compatible_json(label, prompt, settings, params, OpenAiCompatVendor::LmStudio)
+}
 
-  let body = json!({
-    "model": settings.model_path.trim(),
-    "messages": [
-      { "role": "user", "content": prompt }
-    ],
-    "temperature": params.temperature,
-    "max_tokens": max_tokens,
-    "stream": false,
-    // LM Studio(OpenAI 兼容)结构化输出：阶段1/2使用 JSON Schema 强约束。
-    "response_format": response_format
-  });
+fn run_deepseek_json(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+) -> Result<String, AppError> {
+  run_openai_compatible_json(label, prompt, settings, params, OpenAiCompatVendor::DeepSeek)
+}
+
+fn run_dashscope_json(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+) -> Result<String, AppError> {
+  run_openai_compatible_json(label, prompt, settings, params, OpenAiCompatVendor::DashScope)
+}
+
+fn run_volc_ark_json(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+) -> Result<String, AppError> {
+  run_openai_compatible_json(label, prompt, settings, params, OpenAiCompatVendor::VolcArk)
+}
+
+fn run_openai_compatible_json(
+  label: &str,
+  prompt: &str,
+  settings: &LlmSettings,
+  params: JsonPromptParams,
+  vendor: OpenAiCompatVendor,
+) -> Result<String, AppError> {
+  let base_url = match vendor {
+    OpenAiCompatVendor::LmStudio => normalize_lmstudio_base_url(&settings.llama_cli_path),
+    OpenAiCompatVendor::DeepSeek => normalize_deepseek_base_url(&settings.llama_cli_path),
+    OpenAiCompatVendor::DashScope => normalize_dashscope_base_url(&settings.llama_cli_path),
+    OpenAiCompatVendor::VolcArk => normalize_volc_ark_base_url(&settings.llama_cli_path),
+  };
+  let vendor_zh = match vendor {
+    OpenAiCompatVendor::LmStudio => "LM Studio",
+    OpenAiCompatVendor::DeepSeek => "DeepSeek",
+    OpenAiCompatVendor::DashScope => "DashScope",
+    OpenAiCompatVendor::VolcArk => "火山方舟",
+  };
+  let bearer_header: Option<String> = match vendor {
+    OpenAiCompatVendor::LmStudio => None,
+    OpenAiCompatVendor::DeepSeek => Some(format!("Bearer {}", deepseek_api_key(settings)?)),
+    OpenAiCompatVendor::DashScope => Some(format!("Bearer {}", dashscope_api_key(settings)?)),
+    OpenAiCompatVendor::VolcArk => Some(format!("Bearer {}", volc_ark_api_key(settings)?)),
+  };
+  let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+  let max_tokens = openai_compat_max_tokens(vendor, label, &params, settings.cloud_max_output_tokens);
+  let schema_name = "generic_json_schema";
+  // 简历解析为 resume + jdScreeningIndex 嵌套结构，OpenAI json_schema 约束不适用，统一走 text。
+  let structured_stage = false;
+  // DeepSeek / DashScope 等当前不支持或不稳定支持 response_format=json_schema，直接走 text。
+  let mut schema_fallback_enabled = matches!(
+    vendor,
+    OpenAiCompatVendor::DeepSeek | OpenAiCompatVendor::DashScope | OpenAiCompatVendor::VolcArk
+  );
+  let mut timeout_secs = request_timeout_secs_for_label(label);
+  if matches!(
+    vendor,
+    OpenAiCompatVendor::DeepSeek | OpenAiCompatVendor::DashScope | OpenAiCompatVendor::VolcArk
+  ) {
+    if label == "resume_parse" {
+      timeout_secs = timeout_secs.max(300);
+    } else if label.starts_with("jd_") {
+      timeout_secs = timeout_secs.max(120);
+    } else {
+      timeout_secs = timeout_secs.max(180);
+    }
+  }
 
   resume_parse_log!(
     debug,
@@ -517,20 +819,112 @@ fn run_lmstudio_json(
     label,
     endpoint,
     prompt.chars().count(),
-    OLLAMA_REQUEST_TIMEOUT_SECS,
+    timeout_secs,
     OLLAMA_MAX_ATTEMPTS,
     max_tokens
   );
 
   let mut last_err: Option<String> = None;
   for attempt in 1..=OLLAMA_MAX_ATTEMPTS {
-    let result = ureq::post(&endpoint)
+    let response_format = if structured_stage && !schema_fallback_enabled {
+      json!({
+        "type": "json_schema",
+        "json_schema": {
+          "name": schema_name,
+          "strict": true,
+          "schema": resume_json_schema()
+        }
+      })
+    } else {
+      json!({ "type": "text" })
+    };
+    let body = json!({
+      "model": settings.model_path.trim(),
+      "messages": [
+        { "role": "user", "content": prompt }
+      ],
+      "temperature": params.temperature,
+      "max_tokens": max_tokens,
+      "stream": false,
+      // OpenAI 兼容：不支持 json_schema 时会自动降级到 text。
+      "response_format": response_format
+    });
+    let mut req_builder = ureq::post(&endpoint)
       .set("Content-Type", "application/json")
-      .timeout(Duration::from_secs(OLLAMA_REQUEST_TIMEOUT_SECS))
-      .send_json(body.clone());
+      .timeout(Duration::from_secs(timeout_secs));
+    if let Some(ref auth) = bearer_header {
+      req_builder = req_builder.set("Authorization", auth.as_str());
+    }
+    let result = req_builder.send_json(body.clone());
 
     let resp = match result {
       Ok(resp) => resp,
+      Err(ureq::Error::Status(code, resp)) => {
+        let err_body = resp
+          .into_string()
+          .unwrap_or_else(|_| "<empty error body>".to_string());
+        let err_text = format!("status code {}: {}", code, err_body);
+        if structured_stage && !schema_fallback_enabled && code == 400 {
+          schema_fallback_enabled = true;
+          resume_parse_log!(
+            warn,
+            "{}: [{}] {} 不支持 json_schema，自动降级为 text 后重试；err={}",
+            llm_log_prefix(label),
+            label,
+            vendor_zh,
+            clip(&err_text, 500)
+          );
+          continue;
+        }
+        last_err = Some(err_text.clone());
+        if attempt < OLLAMA_MAX_ATTEMPTS {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
+            llm_log_prefix(label),
+            label,
+            attempt,
+            OLLAMA_MAX_ATTEMPTS,
+            base_url,
+            err_text,
+            OLLAMA_RETRY_DELAY_MS
+          );
+          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
+          llm_log_prefix(label),
+          label,
+          attempt,
+          OLLAMA_MAX_ATTEMPTS,
+          base_url,
+          err_text
+        );
+        let hint = match vendor {
+          OpenAiCompatVendor::LmStudio => format!(
+            "请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。",
+            base_url
+          ),
+          OpenAiCompatVendor::DeepSeek => format!(
+            "请确认 llmApiKey / 环境变量 DEEPSEEK_API_KEY 正确，且可访问：{}。",
+            base_url
+          ),
+          OpenAiCompatVendor::DashScope => format!(
+            "请确认 llmApiKey / 环境变量 DASHSCOPE_API_KEY 正确，且可访问：{}（国际区可改 llamaCliPath 为国际 compatible-mode 地址）。",
+            base_url
+          ),
+          OpenAiCompatVendor::VolcArk => format!(
+            "请确认 llmApiKey / 环境变量 ARK_API_KEY 正确，且可访问：{}（其他地域 endpoint 可改 llamaCliPath）。",
+            base_url
+          ),
+        };
+        return Err(AppError::msg(format!(
+          "调用 {} 失败（阶段：{}，已重试 {} 次）：{}。{}",
+          vendor_zh, label, OLLAMA_MAX_ATTEMPTS, err_text, hint
+        )));
+      }
       Err(e) => {
         let err_text = e.to_string();
         last_err = Some(err_text.clone());
@@ -559,12 +953,27 @@ fn run_lmstudio_json(
           base_url,
           err_text
         );
+        let hint = match vendor {
+          OpenAiCompatVendor::LmStudio => format!(
+            "请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。",
+            base_url
+          ),
+          OpenAiCompatVendor::DeepSeek => format!(
+            "请确认 llmApiKey / 环境变量 DEEPSEEK_API_KEY 正确，且可访问：{}。",
+            base_url
+          ),
+          OpenAiCompatVendor::DashScope => format!(
+            "请确认 llmApiKey / 环境变量 DASHSCOPE_API_KEY 正确，且可访问：{}（国际区可改 llamaCliPath 为国际 compatible-mode 地址）。",
+            base_url
+          ),
+          OpenAiCompatVendor::VolcArk => format!(
+            "请确认 llmApiKey / 环境变量 ARK_API_KEY 正确，且可访问：{}（其他地域 endpoint 可改 llamaCliPath）。",
+            base_url
+          ),
+        };
         return Err(AppError::msg(format!(
-          "调用 LM Studio 失败（阶段：{}，已重试 {} 次）：{}。请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。",
-          label,
-          OLLAMA_MAX_ATTEMPTS,
-          err_text,
-          base_url
+          "调用 {} 失败（阶段：{}，已重试 {} 次）：{}。{}",
+          vendor_zh, label, OLLAMA_MAX_ATTEMPTS, err_text, hint
         )));
       }
     };
@@ -572,24 +981,26 @@ fn run_lmstudio_json(
     let payload: Value = resp.into_json().map_err(|e| {
       resume_parse_log!(
         error,
-        "{}: [{}] 解析 LM Studio JSON 响应失败: {}",
+        "{}: [{}] 解析 {} JSON 响应失败: {}",
         llm_log_prefix(label),
         label,
+        vendor_zh,
         e
       );
-      AppError::msg(format!("解析 LM Studio 响应失败：{}", e))
+      AppError::msg(format!("解析 {} 响应失败：{}", vendor_zh, e))
     })?;
 
     if let Some(err) = payload.get("error") {
       let msg = err.to_string();
       resume_parse_log!(
         error,
-        "{}: [{}] LM Studio 返回 error: {}",
+        "{}: [{}] {} 返回 error: {}",
         llm_log_prefix(label),
         label,
+        vendor_zh,
         msg
       );
-      return Err(AppError::msg(format!("LM Studio 返回错误：{}", msg)));
+      return Err(AppError::msg(format!("{} 返回错误：{}", vendor_zh, msg)));
     }
 
     let first_choice = payload
@@ -604,7 +1015,7 @@ fn run_lmstudio_json(
           label,
           payload
         );
-        AppError::msg(format!("LM Studio 响应缺少 choices[0]：{}", payload))
+        AppError::msg(format!("{} 响应缺少 choices[0]：{}", vendor_zh, payload))
       })?;
 
     let finish_reason = first_choice
@@ -619,7 +1030,10 @@ fn run_lmstudio_json(
         label,
         payload
       );
-      AppError::msg(format!("LM Studio 响应缺少 choices[0].message：{}", payload))
+      AppError::msg(format!(
+        "{} 响应缺少 choices[0].message：{}",
+        vendor_zh, payload
+      ))
     })?;
     let content_text = message
       .get("content")
@@ -650,13 +1064,13 @@ fn run_lmstudio_json(
         payload
       );
       return Err(AppError::msg(format!(
-        "LM Studio 响应内容为空（content/reasoning_content 均为空，finish_reason={}）",
-        finish_reason
+        "{} 响应内容为空（content/reasoning_content 均为空，finish_reason={}）",
+        vendor_zh, finish_reason
       )));
     };
 
     let extracted = match extract_json_object(raw_text) {
-      Some(v) => v,
+      Some(v) => sanitize_json_control_chars_inside_strings(&v),
       None => {
         let err_text = format!("模型输出中未找到 JSON 对象。原始输出前800字符：{}", clip(raw_text, 800));
         last_err = Some(err_text.clone());
@@ -725,7 +1139,8 @@ fn run_lmstudio_json(
   }
 
   Err(AppError::msg(format!(
-    "调用 LM Studio 失败（阶段：{}）：{}",
+    "调用 {} 失败（阶段：{}）：{}",
+    vendor_zh,
     label,
     last_err.unwrap_or_else(|| "未知错误".to_string())
   )))
@@ -837,6 +1252,40 @@ fn looks_like_gguf_path(value: &str) -> bool {
   v.ends_with(".gguf")
 }
 
+/// 部分云端模型会在 JSON **字符串值**内直接插入换行等控制字符（非法 JSON）。在解析前将其替换为空格，避免 `serde_json` 报错。
+fn sanitize_json_control_chars_inside_strings(raw: &str) -> String {
+  let mut out = String::with_capacity(raw.len());
+  let mut in_string = false;
+  let mut escape = false;
+  for ch in raw.chars() {
+    if in_string {
+      if escape {
+        out.push(ch);
+        escape = false;
+        continue;
+      }
+      match ch {
+        '\\' => {
+          out.push(ch);
+          escape = true;
+        }
+        '"' => {
+          in_string = false;
+          out.push(ch);
+        }
+        ch if ch <= '\u{1F}' => out.push(' '),
+        _ => out.push(ch),
+      }
+    } else if ch == '"' {
+      in_string = true;
+      out.push(ch);
+    } else {
+      out.push(ch);
+    }
+  }
+  out
+}
+
 fn extract_json_object(s: &str) -> Option<String> {
   let s = s.trim().trim_matches('\u{feff}');
 
@@ -943,6 +1392,7 @@ fn unwrap_wrapped_resume_payload(v: &mut Value) {
   }
 
   let candidate = extract_json_object(&resp).unwrap_or(resp);
+  let candidate = sanitize_json_control_chars_inside_strings(&candidate);
   if let Ok(inner) = serde_json::from_str::<Value>(&candidate) {
     if inner.is_object() {
       *v = inner;
@@ -1194,149 +1644,6 @@ fn sanitize_indexed_items(value: &mut Value, required_keys: &[&str]) {
 
     *item = Value::Object(obj);
   }
-}
-
-fn preserve_project_items(stage1: &ResumeData, mut final_data: ResumeData) -> ResumeData {
-  let s1 = count_non_empty_projects(&stage1.project_experience);
-  let s2 = count_non_empty_projects(&final_data.project_experience);
-  if s1 > 0 && s2 < s1 {
-    final_data.project_experience = stage1.project_experience.clone();
-  }
-  final_data
-}
-
-/// 第二阶段模型常把多段工作经历合并成更少条目；若条数变少则回退第一阶段骨架（与 `preserve_project_items` 对称）。
-fn preserve_work_items(stage1: &ResumeData, mut final_data: ResumeData) -> ResumeData {
-  let s1 = count_non_empty_work(&stage1.work_experience);
-  let s2 = count_non_empty_work(&final_data.work_experience);
-  if s1 > s2 {
-    resume_parse_log!(
-      warn,
-      "resume_parse: stage2 工作经历条数少于 stage1（{} < {}），回退 stage1 工作经历",
-      s2,
-      s1
-    );
-    final_data.work_experience = stage1.work_experience.clone();
-  }
-  // 条目数一致时，仍可能出现阶段2把时间段截断为“2018 年 09 月 -”这类不完整形式；
-  // 对同索引条目做逐项兜底，优先保留更完整的时间段。
-  backfill_work_periods_from_stage1(stage1, &mut final_data);
-  final_data
-}
-
-fn looks_like_prompt_title_name(name: &str) -> bool {
-  let n = name.trim();
-  n.starts_with("解析简历（") || n.starts_with("解析简历(") || n.contains("第一阶段") || n.contains("第二阶段")
-}
-
-fn preserve_basic_and_details(stage1: &ResumeData, mut final_data: ResumeData) -> ResumeData {
-  let s1_name = stage1.basic_info.name.trim();
-  let s2_name = final_data.basic_info.name.trim();
-  if !s1_name.is_empty() && (s2_name.is_empty() || looks_like_prompt_title_name(s2_name)) {
-    resume_parse_log!(
-      warn,
-      "resume_parse: stage2 姓名疑似异常（'{}'），回退 stage1 姓名='{}'",
-      s2_name,
-      s1_name
-    );
-    final_data.basic_info.name = stage1.basic_info.name.clone();
-  }
-
-  for (idx, item) in final_data.work_experience.iter_mut() {
-    if let Some(s1) = stage1.work_experience.get(idx) {
-      if item.description.trim().is_empty() && !s1.description.trim().is_empty() {
-        item.description = s1.description.clone();
-      }
-      if item.company.trim().is_empty() && !s1.company.trim().is_empty() {
-        item.company = s1.company.clone();
-      }
-      if item.position.trim().is_empty() && !s1.position.trim().is_empty() {
-        item.position = s1.position.clone();
-      }
-    }
-  }
-
-  for (idx, item) in final_data.project_experience.iter_mut() {
-    if let Some(s1) = stage1.project_experience.get(idx) {
-      if item.project_description.trim().is_empty() && !s1.project_description.trim().is_empty() {
-        item.project_description = s1.project_description.clone();
-      }
-      if item.project_achievements.trim().is_empty() && !s1.project_achievements.trim().is_empty() {
-        item.project_achievements = s1.project_achievements.clone();
-      }
-      if item.project_name.trim().is_empty() && !s1.project_name.trim().is_empty() {
-        item.project_name = s1.project_name.clone();
-      }
-    }
-  }
-
-  final_data
-}
-
-fn looks_incomplete_period(period: &str) -> bool {
-  let p = period.trim();
-  if p.is_empty() {
-    return true;
-  }
-  let compact = p.replace(' ', "");
-  compact.ends_with('-')
-    || compact.ends_with('－')
-    || compact.ends_with('–')
-    || compact.ends_with('—')
-    || compact.ends_with("至")
-    || compact.ends_with("到")
-}
-
-fn is_more_complete_period(candidate: &str, current: &str) -> bool {
-  let c = candidate.trim();
-  let cur = current.trim();
-  if c.is_empty() {
-    return false;
-  }
-  if looks_incomplete_period(cur) && !looks_incomplete_period(c) {
-    return true;
-  }
-  c.chars().count() > cur.chars().count() + 2
-}
-
-fn backfill_work_periods_from_stage1(stage1: &ResumeData, final_data: &mut ResumeData) {
-  for (idx, final_item) in final_data.work_experience.iter_mut() {
-    if let Some(stage1_item) = stage1.work_experience.get(idx) {
-      if is_more_complete_period(&stage1_item.period, &final_item.period) {
-        resume_parse_log!(
-          debug,
-          "resume_parse: work period backfill idx={} from='{}' to='{}'",
-          idx,
-          final_item.period,
-          stage1_item.period
-        );
-        final_item.period = stage1_item.period.clone();
-      }
-    }
-  }
-}
-
-fn count_non_empty_work(items: &BTreeMap<String, WorkItem>) -> usize {
-  items
-    .values()
-    .filter(|w| {
-      !w.company.trim().is_empty()
-        || !w.position.trim().is_empty()
-        || !w.period.trim().is_empty()
-        || !w.description.trim().is_empty()
-    })
-    .count()
-}
-
-fn count_non_empty_projects(items: &BTreeMap<String, ProjectItem>) -> usize {
-  items
-    .values()
-    .filter(|p| {
-      !p.project_name.trim().is_empty()
-        || !p.project_description.trim().is_empty()
-        || !p.project_achievements.trim().is_empty()
-    })
-    .count()
 }
 
 fn filter_resume_by_source_text(mut data: ResumeData, source_text: &str) -> ResumeData {

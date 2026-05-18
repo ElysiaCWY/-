@@ -19,6 +19,7 @@
           <a class="nav-item" data-page="library" href="#library">简历库</a>
           <a class="nav-item" data-page="parse" href="#parse">导入与解析</a>
           <a class="nav-item" data-page="word2pdf" href="#word2pdf">Word 转 PDF</a>
+          <a class="nav-item" data-page="settings" href="#settings">AI 配置</a>
           <a class="nav-item" data-page="jd" href="#jd">JD 管理筛选</a>
         </nav>
       </aside>
@@ -27,7 +28,6 @@
         <header class="topbar">
           <div>
             <h1 id="pageTitle">首页概览</h1>
-            <p class="subtext">Windows 本地版 · 数据不出本机 · 低配优先</p>
           </div>
           <div class="top-actions">
             <button id="quickImport" class="primary">导入简历</button>
@@ -73,6 +73,9 @@
             <div class="row">
               <button id="btnImport" class="primary">批量导入并抽取文本</button>
               <button id="btnParse" class="primary">开始批量解析</button>
+              <label style="margin-left: 10px; cursor: pointer;">
+                <input type="checkbox" id="useBatchSwitch" /> 开启批处理模式
+              </label>
               <button id="btnClear" class="ghost">清空</button>
             </div>
             <div class="row">
@@ -139,6 +142,67 @@
           </section>
         </section>
 
+        <section class="page" data-page="settings">
+          <section class="card">
+            <h2>AI 配置（app-config.json）</h2>
+            <p class="subtext" style="margin-top: 0">
+              填写后点击保存，将写入本机配置文件（与程序查找 <code>app-config.json</code> 的规则一致）。API Key 以明文保存在该文件中，请勿分享此文件。
+            </p>
+            <p id="aiSettingsPathHint" class="small mono muted" style="margin: 8px 0 12px">路径加载中…</p>
+            <div id="aiSettingsForm" class="ai-settings-form">
+              <div class="ai-field-row">
+                <label for="aiLlmProvider">llmProvider</label>
+                <select id="aiLlmProvider">
+                  <option value="ollama">ollama（本地）</option>
+                  <option value="lmstudio">lmstudio</option>
+                  <option value="deepseek">deepseek</option>
+                  <option value="dashscope">dashscope</option>
+                  <option value="qwen">qwen（同 DashScope）</option>
+                  <option value="doubao">doubao / 火山方舟</option>
+                  <option value="ark">ark</option>
+                  <option value="volcengine">volcengine</option>
+                  <option value="volc">volc</option>
+                </select>
+              </div>
+              <div class="ai-field-row">
+                <label for="aiModelPath">modelPath</label>
+                <input id="aiModelPath" type="text" spellcheck="false" placeholder="如 qwen3.5-flash 或 Ollama 模型名" />
+              </div>
+              <div class="ai-field-row">
+                <label for="aiLlamaCliPath">llamaCliPath</label>
+                <input id="aiLlamaCliPath" type="text" spellcheck="false" placeholder="API Base 或 Ollama/LM Studio 地址；可留空用默认" />
+              </div>
+              <div class="ai-field-row">
+                <label for="aiLlmApiKey">llmApiKey</label>
+                <input id="aiLlmApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="云端密钥；可留空改用环境变量" />
+              </div>
+              <div class="ai-field-row">
+                <label for="aiThreads">threads</label>
+                <input id="aiThreads" type="number" min="1" max="64" step="1" />
+              </div>
+              <div class="ai-field-row">
+                <label for="aiTemperature">temperature</label>
+                <input id="aiTemperature" type="number" min="0" max="2" step="0.1" />
+              </div>
+              <div class="ai-field-row">
+                <label for="aiCloudMaxOutputTokens">cloudMaxOutputTokens</label>
+                <input
+                  id="aiCloudMaxOutputTokens"
+                  type="number"
+                  min="2048"
+                  max="65536"
+                  step="256"
+                  placeholder="留空则内置上限；≥2048 才生效"
+                />
+              </div>
+              <div class="row" style="margin-top: 16px; flex-wrap: wrap; gap: 10px">
+                <button id="aiSettingsSave" type="button" class="primary">保存并写入 app-config.json</button>
+                <button id="aiSettingsReload" type="button" class="ghost">从磁盘重新加载</button>
+              </div>
+            </div>
+          </section>
+        </section>
+
         <section class="page" data-page="library">
           <section class="card">
             <h2>简历库筛选</h2>
@@ -161,13 +225,14 @@
               <input id="librarySkill" placeholder="技能标签（如：Python）" />
               <button id="libraryFilterBtn">筛选</button>
               <button id="libraryResetBtn" class="ghost">重置</button>
+              <button id="libraryDeleteSelectedBtn" class="ghost" disabled>批量删除</button>
             </div>
           </section>
           <section class="card">
             <h2>简历列表</h2>
             <table class="table">
-              <thead><tr><th>姓名</th><th>性别</th><th>年龄</th><th>最高学历</th><th>岗位</th><th>工作年限</th><th>导入日期</th><th>查看详情</th><th>删除</th></tr></thead>
-              <tbody id="libraryTableBody"><tr><td colspan="9" class="muted">暂无简历数据</td></tr></tbody>
+              <thead><tr><th><input id="librarySelectAll" type="checkbox" title="全选当前列表" /></th><th>姓名</th><th>性别</th><th>年龄</th><th>最高学历</th><th>岗位</th><th>工作年限</th><th>导入日期</th><th>查看详情</th><th>删除</th></tr></thead>
+              <tbody id="libraryTableBody"><tr><td colspan="10" class="muted">暂无简历数据</td></tr></tbody>
             </table>
           </section>
         </section>
@@ -202,6 +267,13 @@
                 <tbody id="resumeDetailProjectBody"><tr><td colspan="3" class="muted">暂无项目经历</td></tr></tbody>
               </table>
             </section>
+            <section class="card detail-card">
+              <h2>JD 筛选索引（解析摘要）</h2>
+              <p class="muted" style="font-size: 0.9em; margin: 0 0 0.75rem">
+                以下为解析阶段生成的摘要与标签，供 JD 筛选时压缩送入模型使用。
+              </p>
+              <div id="resumeDetailJdSummary" class="muted">加载中…</div>
+            </section>
           </section>
         </section>
 
@@ -217,10 +289,24 @@
                 <option value="50">显示前 50 个</option>
               </select>
             </div>
+            <div class="row" style="align-items: center; gap: 0.5rem; flex-wrap: wrap">
+              <label for="jdRerankPool" class="muted">初筛后精排份数</label>
+              <input type="number" id="jdRerankPool" min="1" max="75" value="25" style="width: 4.5rem" />
+              <span class="muted" style="font-size: 0.9em">（1～75，默认 25；与「显示前 N」独立）</span>
+            </div>
             <textarea id="jdInput" placeholder="粘贴 JD 文本…" spellcheck="false"></textarea>
             <div class="row">
               <button id="btnScore" class="primary">计算匹配分</button>
               <span id="scoreOut" class="mono muted"></span>
+            </div>
+            <div id="jdFilterProgressWrap" class="queue-progress-wrap" style="display: none; margin-top: 0.5rem">
+              <div class="queue-progress-meta">
+                <span id="jdFilterProgressPhase" class="muted"></span>
+                <span id="jdFilterProgressFrac" class="mono">0 / 0</span>
+              </div>
+              <div class="queue-progress-track">
+                <div id="jdFilterProgressBar" class="queue-progress-fill" style="width: 0%"></div>
+              </div>
             </div>
             <div class="mini-card">
               <h3>匹配结果（按匹配度排序）</h3>
@@ -242,6 +328,10 @@
               <div id="tplCandidateList" class="muted">请先在上方执行“计算匹配分”，此处将同步展示筛选名单。</div>
             </div>
             <div class="row">
+              <label><input id="tplName" type="checkbox" checked /> 姓名</label>
+              <label><input id="tplGender" type="checkbox" checked /> 性别</label>
+              <label><input id="tplAge" type="checkbox" checked /> 年龄</label>
+              <label><input id="tplContact" type="checkbox" checked /> 联系方式</label>
               <label><input id="tplSkill" type="checkbox" checked /> 技能</label>
             </div>
             <div class="mini-card">

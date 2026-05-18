@@ -1,12 +1,14 @@
 use crate::errors::AppError;
 use crate::jd::{JdStructuredRequirement, ResumeStructuredForScore};
 use crate::llm::{complete_json_prompt, JsonPromptParams, LlmSettings};
-use crate::schema::{AppSettings, JdRecord, ParsedJdScoreRecord, ParsedResultRecord, ResumeData, ResumeRecord};
+use crate::privacy_mask::{mask_sensitive_segments, unmask_sensitive_segments, LLM_PLACEHOLDER_GUARD};
+use crate::schema::{AppSettings, JdRecord, JdScreeningIndex, ParsedJdScoreRecord, ParsedResultRecord, ResumeData, ResumeRecord};
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -57,8 +59,109 @@ fn open_resumes_db() -> Result<Connection, AppError> {
   let db_path = resumes_db_path()?;
   migrate_legacy_db_if_needed(&db_path)?;
   let conn = Connection::open(db_path).map_err(|e| AppError::msg(format!("打开 SQLite 失败：{}", e)))?;
+  apply_sqlite_pragmas(&conn)?;
   init_resumes_db(&conn)?;
   Ok(conn)
+}
+
+/// 桌面单机场景：WAL + 适度同步 + 更大页缓存与 mmap，减轻 JD 预筛与批量写入抖动。
+fn apply_sqlite_pragmas(conn: &Connection) -> Result<(), AppError> {
+  let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+  conn
+    .execute_batch(
+      "PRAGMA synchronous=NORMAL;
+       PRAGMA cache_size=-64000;
+       PRAGMA mmap_size=268435456;",
+    )
+    .map_err(|e| AppError::msg(format!("设置 SQLite PRAGMA 失败：{}", e)))?;
+  Ok(())
+}
+
+const SCHEMA_USER_VERSION_V2: i32 = 2;
+
+/// 回填 `degree_rank`、创建 JD 预筛复合索引，并执行一次 ANALYZE（仅升级时跑一次）。
+fn migrate_parsed_resumes_to_v2(conn: &Connection) -> Result<(), AppError> {
+  let ver: i32 = conn
+    .query_row("PRAGMA user_version", [], |r| r.get(0))
+    .unwrap_or(0);
+  if ver >= SCHEMA_USER_VERSION_V2 {
+    return Ok(());
+  }
+  conn
+    .execute(
+      "UPDATE parsed_resumes SET degree_rank = CASE
+        WHEN lower(degree) LIKE '%博士%' OR lower(degree) LIKE '%phd%' THEN 4
+        WHEN lower(degree) LIKE '%硕士%' OR lower(degree) LIKE '%研究生%' OR lower(degree) LIKE '%master%' THEN 3
+        WHEN lower(degree) LIKE '%本科%' OR lower(degree) LIKE '%学士%' OR lower(degree) LIKE '%bachelor%' THEN 2
+        WHEN lower(degree) LIKE '%大专%' OR lower(degree) LIKE '%专科%' OR lower(degree) LIKE '%college%' THEN 1
+        ELSE 0
+      END",
+      [],
+    )
+    .map_err(|e| AppError::msg(format!("回填 degree_rank 失败：{}", e)))?;
+  conn
+    .execute(
+      "CREATE INDEX IF NOT EXISTS idx_parsed_resumes_jd_prefilter ON parsed_resumes(work_years_num, degree_rank)",
+      [],
+    )
+    .map_err(|e| AppError::msg(format!("创建 JD 预筛复合索引失败：{}", e)))?;
+  conn
+    .pragma_update(None, "user_version", SCHEMA_USER_VERSION_V2)
+    .map_err(|e| AppError::msg(format!("更新 user_version 失败：{}", e)))?;
+  conn
+    .execute("ANALYZE parsed_resumes", [])
+    .map_err(|e| AppError::msg(format!("ANALYZE parsed_resumes 失败：{}", e)))?;
+  log::info!("SQLite 已迁移至 schema v2：degree_rank + idx_parsed_resumes_jd_prefilter，并已 ANALYZE");
+  Ok(())
+}
+
+/// 在批量导入/解析结束后调用，更新查询计划统计信息。
+pub fn analyze_parsed_resumes_db() -> Result<(), AppError> {
+  let conn = open_resumes_db()?;
+  conn
+    .execute("ANALYZE parsed_resumes", [])
+    .map_err(|e| AppError::msg(format!("ANALYZE parsed_resumes 失败：{}", e)))?;
+  Ok(())
+}
+
+fn log_jd_prefilter_query_plan(conn: &Connection, min_work_years: f32, min_degree_rank: i32) {
+  if !log::log_enabled!(log::Level::Debug) {
+    return;
+  }
+  let sql = "EXPLAIN QUERY PLAN SELECT parsed_id FROM parsed_resumes \
+    WHERE (?1 <= 0 OR work_years_num >= ?1) \
+      AND (?2 <= 0 OR degree_rank >= ?2)";
+  let mut stmt = match conn.prepare(sql) {
+    Ok(s) => s,
+    Err(e) => {
+      log::debug!("jd_prefilter EXPLAIN prepare 失败: {}", e);
+      return;
+    }
+  };
+  let rows = match stmt.query_map(params![min_work_years, min_degree_rank], |row| {
+    Ok((
+      row.get::<_, i64>(0)?,
+      row.get::<_, i64>(1)?,
+      row.get::<_, i64>(2)?,
+      row.get::<_, String>(3)?,
+    ))
+  }) {
+    Ok(r) => r,
+    Err(e) => {
+      log::debug!("jd_prefilter EXPLAIN query_map 失败: {}", e);
+      return;
+    }
+  };
+  for row in rows.flatten() {
+    let (id, parent, notused, detail) = row;
+    log::debug!(
+      "jd_prefilter EXPLAIN QUERY PLAN: id={} parent={} notused={} detail={}",
+      id,
+      parent,
+      notused,
+      detail
+    );
+  }
 }
 
 fn init_resumes_db(conn: &Connection) -> Result<(), AppError> {
@@ -89,6 +192,19 @@ fn init_resumes_db(conn: &Connection) -> Result<(), AppError> {
     )
     .map_err(|e| AppError::msg(format!("初始化 SQLite 表失败：{}", e)))?;
   add_column_if_missing(conn, "parsed_resumes", "contact", "TEXT NOT NULL DEFAULT ''")?;
+  add_column_if_missing(
+    conn,
+    "parsed_resumes",
+    "degree_rank",
+    "INTEGER NOT NULL DEFAULT 0",
+  )?;
+  add_column_if_missing(
+    conn,
+    "parsed_resumes",
+    "jd_screening_json_path",
+    "TEXT NOT NULL DEFAULT ''",
+  )?;
+  migrate_parsed_resumes_to_v2(conn)?;
   Ok(())
 }
 
@@ -109,10 +225,21 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, def: &str
 
 pub(crate) fn project_root_dir() -> Result<PathBuf, AppError> {
   let settings = settings_path()?;
-  settings
+  let parent = settings
     .parent()
     .map(|p| p.to_path_buf())
-    .ok_or_else(|| AppError::msg("无法定位项目根目录"))
+    .ok_or_else(|| AppError::msg("无法定位项目根目录"))?;
+  // 安装包内默认配置在 exe 同级的 resources/app-config.json，数据目录仍放在安装根（与 exe 并列），而非 resources 子目录内。
+  if parent.file_name().and_then(|n| n.to_str()) == Some("resources") {
+    if let Ok(exe) = std::env::current_exe() {
+      if let Some(exe_dir) = exe.parent() {
+        if settings.starts_with(exe_dir) {
+          return Ok(exe_dir.to_path_buf());
+        }
+      }
+    }
+  }
+  Ok(parent)
 }
 
 fn parsed_results_dir() -> Result<PathBuf, AppError> {
@@ -146,8 +273,17 @@ fn find_in_ancestors(start: &Path, file_name: &str, max_depth: usize) -> Option<
 fn settings_path() -> Result<PathBuf, AppError> {
   if let Ok(exe) = std::env::current_exe() {
     if let Some(exe_dir) = exe.parent() {
-      if let Some(found) = find_in_ancestors(exe_dir, "app-config.json", 5) {
+      let beside = exe_dir.join("app-config.json");
+      if beside.exists() {
+        return Ok(beside);
+      }
+      // 调试构建下 exe 在 target/debug，内置默认在 resources/；若先选 resources，会覆盖仓库根目录的 app-config.json。
+      if let Some(found) = find_in_ancestors(exe_dir, "app-config.json", 8) {
         return Ok(found);
+      }
+      let bundled = exe_dir.join("resources").join("app-config.json");
+      if bundled.exists() {
+        return Ok(bundled);
       }
     }
   }
@@ -307,6 +443,85 @@ fn unique_json_path(base_dir: &Path, base_name: &str) -> PathBuf {
   base_dir.join(format!("{}_{}.json", base_name, now_epoch()))
 }
 
+/// 与 `*.json` 简历文件同目录、同主文件名，扩展名为 `.jd-screening.json`。
+fn jd_screening_sibling_path(resume_json_path: &Path) -> PathBuf {
+  let stem = resume_json_path
+    .file_stem()
+    .and_then(|s| s.to_str())
+    .unwrap_or("candidate");
+  resume_json_path
+    .parent()
+    .unwrap_or_else(|| Path::new("."))
+    .join(format!("{}.jd-screening.json", stem))
+}
+
+fn jd_index_path_for_row(resume_json_path: &Path, db_path: &str) -> PathBuf {
+  let p = db_path.trim();
+  if !p.is_empty() {
+    PathBuf::from(p)
+  } else {
+    jd_screening_sibling_path(resume_json_path)
+  }
+}
+
+fn read_jd_screening_index_file(path: &Path) -> Result<Option<JdScreeningIndex>, AppError> {
+  if !path.exists() {
+    return Ok(None);
+  }
+  let idx: JdScreeningIndex = read_json_or_default(path)?;
+  Ok(Some(idx))
+}
+
+fn find_parsed_record_by_resume_id(resume_id: &str) -> Result<Option<ParsedResultRecord>, AppError> {
+  let index_path = parsed_index_path()?;
+  let items: Vec<ParsedResultRecord> = read_json_or_default(&index_path)?;
+  Ok(items
+    .into_iter()
+    .find(|x| x.resume_id.as_deref().map(|s| s.trim()) == Some(resume_id)))
+}
+
+/// 按简历库 `resume_id` 加载解析阶段生成的 JD 筛选索引（`*.jd-screening.json`），供详情页展示。
+pub fn get_jd_screening_index_for_resume(resume_id: &str) -> Result<Option<JdScreeningIndex>, AppError> {
+  let rid = resume_id.trim();
+  if rid.is_empty() {
+    return Ok(None);
+  }
+
+  let try_load = |json_path: &str, jd_col: &str| -> Result<Option<JdScreeningIndex>, AppError> {
+    let resume_path = Path::new(json_path.trim());
+    if resume_path.as_os_str().is_empty() {
+      return Ok(None);
+    }
+    let jd_buf = jd_index_path_for_row(resume_path, jd_col);
+    read_jd_screening_index_file(&jd_buf)
+  };
+
+  let conn = open_resumes_db()?;
+  match conn.query_row(
+    "SELECT json_path, jd_screening_json_path FROM parsed_resumes \
+     WHERE trim(coalesce(resume_id,'')) = ?1 \
+     ORDER BY updated_at DESC LIMIT 1",
+    params![rid],
+    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+  ) {
+    Ok((json_path, jd_col)) => {
+      if let Some(idx) = try_load(&json_path, &jd_col)? {
+        return Ok(Some(idx));
+      }
+    }
+    Err(rusqlite::Error::QueryReturnedNoRows) => {}
+    Err(e) => return Err(AppError::msg(format!("查询解析索引失败：{}", e))),
+  }
+
+  if let Some(rec) = find_parsed_record_by_resume_id(rid)? {
+    if let Some(idx) = try_load(&rec.json_path, &rec.jd_screening_json_path)? {
+      return Ok(Some(idx));
+    }
+  }
+
+  Ok(None)
+}
+
 /// 按解析得到的主岗位名作为子目录名；若已有相似目录则复用，避免重复建「后端开发 / 后端 开发」等。
 fn classify_position_folder(root_dir: &Path, position: &str) -> String {
   let normalized = position
@@ -417,11 +632,36 @@ pub fn save_resume(source_file: String, data: ResumeData) -> Result<ResumeRecord
 }
 
 pub fn delete_resume(id: String) -> Result<(), AppError> {
+  if delete_resume_if_exists(id.trim())? {
+    return Ok(());
+  }
+  Err(AppError::msg("未找到要删除的简历记录"))
+}
+
+pub fn delete_resumes(ids: Vec<String>) -> Result<usize, AppError> {
+  let mut deleted = 0usize;
+  let mut seen = HashSet::new();
+  for raw_id in ids {
+    let id = raw_id.trim();
+    if id.is_empty() {
+      continue;
+    }
+    if !seen.insert(id.to_string()) {
+      continue;
+    }
+    if delete_resume_if_exists(id)? {
+      deleted += 1;
+    }
+  }
+  Ok(deleted)
+}
+
+fn delete_resume_if_exists(id: &str) -> Result<bool, AppError> {
   let path = resumes_path()?;
   let mut items: Vec<ResumeRecord> = read_json_or_default(&path)?;
   let target = items.iter().find(|x| x.id == id).cloned();
   let Some(target) = target else {
-    return Err(AppError::msg("未找到要删除的简历记录"));
+    return Ok(false);
   };
 
   items.retain(|x| x.id != id);
@@ -436,6 +676,16 @@ pub fn delete_resume(id: String) -> Result<(), AppError> {
       if parsed_record_matches_resume(&record, &target) {
         if !record.json_path.trim().is_empty() {
           let _ = fs::remove_file(&record.json_path);
+          let jd_sib = jd_screening_sibling_path(Path::new(&record.json_path));
+          if jd_sib.exists() {
+            let _ = fs::remove_file(&jd_sib);
+          }
+        }
+        if !record.jd_screening_json_path.trim().is_empty() {
+          let p = Path::new(&record.jd_screening_json_path);
+          if p.exists() {
+            let _ = fs::remove_file(p);
+          }
         }
         removed.push(record);
         continue;
@@ -446,7 +696,7 @@ pub fn delete_resume(id: String) -> Result<(), AppError> {
     delete_parsed_rows_from_sqlite(&removed, &target)?;
   }
 
-  Ok(())
+  Ok(true)
 }
 
 fn delete_parsed_rows_from_sqlite(removed: &[ParsedResultRecord], resume: &ResumeRecord) -> Result<(), AppError> {
@@ -530,6 +780,38 @@ pub fn load_settings() -> Result<AppSettings, AppError> {
     }
   }
   Ok(settings)
+}
+
+/// 将当前 AI 配置写入 `app-config.json`（路径规则与 `load_settings` 一致）。
+pub fn save_settings(settings: &AppSettings) -> Result<(), AppError> {
+  let mut s = settings.clone();
+  s.llm_provider = s.llm_provider.trim().to_ascii_lowercase();
+  if s.llm_provider.is_empty() {
+    s.llm_provider = "ollama".to_string();
+  }
+  s.model_path = s.model_path.trim().to_string();
+  s.llama_cli_path = s.llama_cli_path.trim().to_string();
+  s.llm_api_key = s.llm_api_key.trim().to_string();
+  s.threads = s.threads.clamp(1, 64);
+  s.temperature = s.temperature.clamp(0.0, 2.0);
+  if let Some(n) = s.cloud_max_output_tokens {
+    if n < 2048 {
+      s.cloud_max_output_tokens = None;
+    } else {
+      s.cloud_max_output_tokens = Some(n.min(65536));
+    }
+  }
+  let path = settings_path()?;
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent)?;
+  }
+  write_json(&path, &s)?;
+  Ok(())
+}
+
+/// 当前将读写的 `app-config.json` 绝对路径（用于界面提示）。
+pub fn app_settings_file_path() -> Result<String, AppError> {
+  Ok(settings_path()?.to_string_lossy().into_owned())
 }
 
 fn parsed_record_matches_resume(record: &ParsedResultRecord, resume: &ResumeRecord) -> bool {
@@ -692,13 +974,15 @@ fn upsert_parsed_resume_sqlite(record: &ParsedResultRecord, data: &ResumeData) -
   let work_text = build_work_text(data).to_ascii_lowercase();
   let project_text = build_project_text(data).to_ascii_lowercase();
   let work_years_num = crate::jd::candidate_work_years_num(&record.work_years).unwrap_or(0.0);
+  let degree_rank = crate::jd::degree_rank(&record.degree);
   let updated_at = now_epoch().to_string();
   conn
     .execute(
       "INSERT INTO parsed_resumes (
         parsed_id, resume_id, source_file, candidate_name, age, contact, position, degree, work_years, work_years_num,
-        skills_text, skills_json, work_text, project_text, json_path, imported_date, updated_at
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        degree_rank,
+        skills_text, skills_json, work_text, project_text, jd_screening_json_path, json_path, imported_date, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
       ON CONFLICT(parsed_id) DO UPDATE SET
         resume_id=excluded.resume_id,
         source_file=excluded.source_file,
@@ -709,10 +993,12 @@ fn upsert_parsed_resume_sqlite(record: &ParsedResultRecord, data: &ResumeData) -
         degree=excluded.degree,
         work_years=excluded.work_years,
         work_years_num=excluded.work_years_num,
+        degree_rank=excluded.degree_rank,
         skills_text=excluded.skills_text,
         skills_json=excluded.skills_json,
         work_text=excluded.work_text,
         project_text=excluded.project_text,
+        jd_screening_json_path=excluded.jd_screening_json_path,
         json_path=excluded.json_path,
         imported_date=excluded.imported_date,
         updated_at=excluded.updated_at",
@@ -727,10 +1013,12 @@ fn upsert_parsed_resume_sqlite(record: &ParsedResultRecord, data: &ResumeData) -
         record.degree,
         record.work_years,
         work_years_num,
+        degree_rank,
         skills_text,
         skills_json,
         work_text,
         project_text,
+        record.jd_screening_json_path,
         record.json_path,
         record.imported_date,
         updated_at
@@ -740,7 +1028,12 @@ fn upsert_parsed_resume_sqlite(record: &ParsedResultRecord, data: &ResumeData) -
   Ok(())
 }
 
-pub fn save_parsed_result_json(source_file: String, resume_id: String, data: ResumeData) -> Result<ParsedResultRecord, AppError> {
+pub fn save_parsed_result_json(
+  source_file: String,
+  resume_id: String,
+  data: ResumeData,
+  jd_index: JdScreeningIndex,
+) -> Result<ParsedResultRecord, AppError> {
   let root_dir = parsed_results_dir()?;
   let index_path = parsed_index_path()?;
 
@@ -758,6 +1051,7 @@ pub fn save_parsed_result_json(source_file: String, resume_id: String, data: Res
   }
   let file_base = sanitize_filename(&candidate_name);
   let json_path = unique_json_path(&dir, &file_base);
+  let jd_path = jd_screening_sibling_path(&json_path);
 
   let mut items: Vec<ParsedResultRecord> = read_json_or_default(&index_path)?;
   let new_identity = identity_key(&candidate_name, &age, &contact);
@@ -783,10 +1077,21 @@ pub fn save_parsed_result_json(source_file: String, resume_id: String, data: Res
   for old in &removed {
     if !old.json_path.trim().is_empty() {
       let _ = fs::remove_file(&old.json_path);
+      let jd_sib = jd_screening_sibling_path(Path::new(&old.json_path));
+      if jd_sib.exists() {
+        let _ = fs::remove_file(&jd_sib);
+      }
+    }
+    if !old.jd_screening_json_path.trim().is_empty() {
+      let p = Path::new(&old.jd_screening_json_path);
+      if p.exists() {
+        let _ = fs::remove_file(p);
+      }
     }
   }
 
   write_json(&json_path, &data)?;
+  write_json(&jd_path, &jd_index)?;
   let record = ParsedResultRecord {
     id: make_id("parsed"),
     created_at: now_epoch().to_string(),
@@ -801,6 +1106,7 @@ pub fn save_parsed_result_json(source_file: String, resume_id: String, data: Res
     work_years,
     skills,
     json_path: json_path.to_string_lossy().to_string(),
+    jd_screening_json_path: jd_path.to_string_lossy().to_string(),
   };
   items.push(record.clone());
   write_json(&index_path, &items)?;
@@ -856,6 +1162,7 @@ pub fn jd_score_from_local_parsed(jd_text: String) -> Result<Vec<ParsedJdScoreRe
       work_years: item.work_years,
       skills: item.skills,
       json_path: item.json_path,
+      jd_screening_json_path: item.jd_screening_json_path,
       score: score.score,
       score_breakdown: crate::schema::JdScoreBreakdown::default(),
       matched_keywords: score.matched_keywords,
@@ -867,51 +1174,18 @@ pub fn jd_score_from_local_parsed(jd_text: String) -> Result<Vec<ParsedJdScoreRe
   Ok(out)
 }
 
-fn position_match(target: &str, query: &str) -> bool {
-  let q = query.trim().to_ascii_lowercase();
-  if q.is_empty() {
-    return true;
-  }
-  let t = target.trim().to_ascii_lowercase();
-  if t.is_empty() {
-    return false;
-  }
-  t.contains(&q) || q.contains(&t)
-}
-
-fn parent_folder_name(path: &str) -> String {
-  let p = PathBuf::from(path);
-  p.parent()
-    .and_then(|x| x.file_name())
-    .and_then(|x| x.to_str())
-    .unwrap_or("")
-    .trim()
-    .to_string()
-}
-
-fn parsed_item_matches_position(item: &ParsedResultRecord, query: &str) -> bool {
-  if query.trim().is_empty() {
-    return true;
-  }
-
-  if position_match(&item.position, query) {
-    return true;
-  }
-
-  let folder = parent_folder_name(&item.json_path);
-  if position_match(&folder, query) {
-    return true;
-  }
-
-  false
-}
-
 fn clamp_limit(limit: i32) -> usize {
   let n = if limit <= 0 { 10 } else { limit };
   (n as usize).min(200)
 }
 
 fn ai_extract_jd_requirements(position: &str, jd_text: &str, settings: &AppSettings) -> Result<JdStructuredRequirement, AppError> {
+  let mut next_id = 0u32;
+  let (pos_masked, m_pos) = mask_sensitive_segments(position.trim(), &mut next_id);
+  let (jd_masked, m_jd) = mask_sensitive_segments(jd_text, &mut next_id);
+  let mut priv_map = m_pos;
+  priv_map.extend_map(m_jd);
+  let guard = if priv_map.is_empty() { "" } else { LLM_PLACEHOLDER_GUARD };
   let prompt = format!(
     "你是 JD 结构化提取助手。请根据岗位名和JD，提取筛选所需结构化要求。\n"
   ) +
@@ -919,9 +1193,10 @@ fn ai_extract_jd_requirements(position: &str, jd_text: &str, settings: &AppSetti
   + "{\"minDegreeRank\":0-4,\"minWorkYears\":number,\"requiredSkills\":[\"...\"],\"preferredSkills\":[\"...\"],\"workKeywords\":[\"...\"],\"projectKeywords\":[\"...\"]}\n"
   + "其中 minDegreeRank 映射：0不限,1大专,2本科,3硕士,4博士。\n"
   + "岗位："
-  + position
+  + &pos_masked
   + "\nJD：\n"
-  + jd_text;
+  + &jd_masked
+  + guard;
 
   let llm = LlmSettings::from(settings);
   let json_text = complete_json_prompt(
@@ -935,6 +1210,7 @@ fn ai_extract_jd_requirements(position: &str, jd_text: &str, settings: &AppSetti
     },
   )
   .map_err(|e| AppError::msg(format!("提取 JD 结构化要求失败：{}", e)))?;
+  let json_text = unmask_sensitive_segments(&json_text, &priv_map);
   let mut req: JdStructuredRequirement = serde_json::from_str(&json_text)
     .map_err(|e| AppError::msg(format!("JD 结构化 JSON 反序列化失败：{}", e)))?;
 
@@ -943,9 +1219,40 @@ fn ai_extract_jd_requirements(position: &str, jd_text: &str, settings: &AppSetti
   Ok(req)
 }
 
-pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit: i32) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
+#[derive(Clone, serde::Serialize)]
+pub struct JdFilterProgressEvent {
+  pub current: u32,
+  pub total: u32,
+  pub message: String,
+  #[serde(default)]
+  pub done: bool,
+}
+
+pub fn jd_filter_by_keywords_from_index(
+  position: String,
+  jd_text: String,
+  limit: i32,
+  rerank_pool: i32,
+  progress: Option<Arc<dyn Fn(JdFilterProgressEvent) + Send + Sync>>,
+) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
+  let emit = |ev: JdFilterProgressEvent| {
+    if let Some(p) = &progress {
+      p(ev);
+    }
+  };
   let top_n = clamp_limit(limit);
+  let rerank_pool = if (1..=75).contains(&rerank_pool) {
+    rerank_pool as usize
+  } else {
+    25
+  };
   let settings = load_settings()?;
+  emit(JdFilterProgressEvent {
+    current: 0,
+    total: 0,
+    message: "正在提取 JD 结构化要求…".into(),
+    done: false,
+  });
   let req = ai_extract_jd_requirements(&position, &jd_text, &settings)?;
   let valid_resume_ids: HashSet<String> = list_resumes()?
     .into_iter()
@@ -954,31 +1261,23 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
     .collect();
   let conn = open_resumes_db()?;
 
-  let mut out: Vec<ParsedJdScoreRecord> = Vec::new();
+  let mut pre_candidates: Vec<ParsedJdScoreRecord> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();
+  log_jd_prefilter_query_plan(&conn, req.min_work_years, req.min_degree_rank);
   let mut stmt = conn
     .prepare(
       "SELECT
         parsed_id, resume_id, source_file, candidate_name, age, contact, position, degree,
-        work_years, skills_json, work_text, project_text, json_path
+        work_years, skills_json, work_text, project_text, jd_screening_json_path, json_path
       FROM parsed_resumes
-      WHERE (?1 = '' OR lower(position) LIKE '%' || lower(?1) || '%')
-        AND (?2 <= 0 OR work_years_num >= ?2)
-        AND (?3 <= 0 OR
-          CASE
-            WHEN lower(degree) LIKE '%博士%' OR lower(degree) LIKE '%phd%' THEN 4
-            WHEN lower(degree) LIKE '%硕士%' OR lower(degree) LIKE '%研究生%' OR lower(degree) LIKE '%master%' THEN 3
-            WHEN lower(degree) LIKE '%本科%' OR lower(degree) LIKE '%学士%' OR lower(degree) LIKE '%bachelor%' THEN 2
-            WHEN lower(degree) LIKE '%大专%' OR lower(degree) LIKE '%专科%' OR lower(degree) LIKE '%college%' THEN 1
-            ELSE 0
-          END >= ?3
-        )",
+      WHERE (?1 <= 0 OR work_years_num >= ?1)
+        AND (?2 <= 0 OR degree_rank >= ?2)",
     )
     .map_err(|e| AppError::msg(format!("准备 SQLite 查询失败：{}", e)))?;
 
   let rows = stmt
     .query_map(
-      params![position.trim(), req.min_work_years, req.min_degree_rank],
+      params![req.min_work_years, req.min_degree_rank],
       |row| {
         Ok((
           row.get::<_, String>(0)?,
@@ -994,6 +1293,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
           row.get::<_, String>(10)?,
           row.get::<_, String>(11)?,
           row.get::<_, String>(12)?,
+          row.get::<_, String>(13)?,
         ))
       },
     )
@@ -1013,6 +1313,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
       skills_json,
       work_text,
       project_text,
+      jd_screening_json_path,
       json_path,
     ) = row.map_err(|e| AppError::msg(format!("读取 SQLite 记录失败：{}", e)))?;
 
@@ -1043,7 +1344,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
     }
     seen.insert(dedupe_key);
 
-    out.push(ParsedJdScoreRecord {
+    pre_candidates.push(ParsedJdScoreRecord {
       parsed_id,
       resume_id,
       candidate_name,
@@ -1055,6 +1356,7 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
       work_years,
       skills,
       json_path,
+      jd_screening_json_path,
       score: score.total_score,
       score_breakdown: score.breakdown,
       matched_keywords: score.matched_keywords,
@@ -1062,28 +1364,125 @@ pub fn jd_filter_by_keywords_from_index(position: String, jd_text: String, limit
     });
   }
 
+  pre_candidates.sort_by(|a, b| b.score.cmp(&a.score));
+  // 关键词初筛后进入 HR 精排的候选上限：取排序后的前 rerank_pool 条，且全部做精排（由界面传入，默认 25，最高 75）。
+  if pre_candidates.len() > rerank_pool {
+    pre_candidates.truncate(rerank_pool);
+  }
+
+  let n = pre_candidates.len();
+  let total = (1 + n as u32).max(1);
+  emit(JdFilterProgressEvent {
+    current: 1,
+    total,
+    message: format!("初筛完成，进入 HR 精排（{} 人）", n),
+    done: false,
+  });
+
+  let mut out: Vec<ParsedJdScoreRecord> = Vec::new();
+  for (i, mut item) in pre_candidates.into_iter().enumerate() {
+    let step = 2 + i as u32;
+    emit(JdFilterProgressEvent {
+      current: step,
+      total,
+      message: format!("HR 精排 {}/{}：{}", i + 1, n, item.candidate_name),
+      done: false,
+    });
+    let fallback_score = item.score;
+    let fallback_breakdown = item.score_breakdown.clone();
+    let fallback_matched = item.matched_keywords.clone();
+    let fallback_total_keywords = item.total_keywords;
+
+    let resume_path = PathBuf::from(item.json_path.clone());
+    if resume_path.exists() {
+      let jd_path_buf = jd_index_path_for_row(&resume_path, &item.jd_screening_json_path);
+      let index_opt: Option<JdScreeningIndex> = if jd_path_buf.exists() {
+        match read_json_or_default::<JdScreeningIndex>(&jd_path_buf) {
+          Ok(idx)
+            if !idx.summary_for_jd.trim().is_empty()
+              || !idx.skill_tags.is_empty()
+              || !idx.work_bullets.trim().is_empty()
+              || !idx.project_bullets.trim().is_empty() =>
+          {
+            Some(idx)
+          }
+          _ => None,
+        }
+      } else {
+        None
+      };
+
+      let hr_ok = index_opt
+        .as_ref()
+        .and_then(|idx| ai_score_resume_hr_from_jd_index(idx, &position, &jd_text, &settings).ok());
+
+      if let Some((ai_total, ai_breakdown, ai_matched, ai_total_keywords)) = hr_ok {
+        item.score = ai_total;
+        item.score_breakdown = ai_breakdown;
+        item.matched_keywords = ai_matched;
+        item.total_keywords = ai_total_keywords;
+      } else if let Ok(resume) = read_json_or_default::<ResumeData>(&resume_path) {
+        if let Ok((ai_total, ai_breakdown, ai_matched, ai_total_keywords)) =
+          ai_score_resume_hr(&resume, &position, &jd_text, &settings)
+        {
+          item.score = ai_total;
+          item.score_breakdown = ai_breakdown;
+          item.matched_keywords = ai_matched;
+          item.total_keywords = ai_total_keywords;
+        } else {
+          item.score = fallback_score;
+          item.score_breakdown = fallback_breakdown;
+          item.matched_keywords = fallback_matched;
+          item.total_keywords = fallback_total_keywords;
+        }
+      } else {
+        item.score = fallback_score;
+        item.score_breakdown = fallback_breakdown;
+        item.matched_keywords = fallback_matched;
+        item.total_keywords = fallback_total_keywords;
+      }
+    }
+    out.push(item);
+  }
+
   out.sort_by(|a, b| b.score.cmp(&a.score));
   if out.len() > top_n {
     out.truncate(top_n);
   }
+  emit(JdFilterProgressEvent {
+    current: total,
+    total,
+    message: "筛选完成".into(),
+    done: true,
+  });
   Ok(out)
 }
 
-fn ai_score_resume_match(resume: &ResumeData, jd_text: &str, settings: &AppSettings) -> Result<(i32, Vec<String>, usize), AppError> {
-  let resume_json = serde_json::to_string(resume)
-    .map_err(|e| AppError::msg(format!("序列化简历失败：{}", e)))?;
-
+fn ai_score_resume_match_from_jd_index(
+  idx: &JdScreeningIndex,
+  jd_text: &str,
+  settings: &AppSettings,
+) -> Result<(i32, Vec<String>, usize), AppError> {
+  let compact = serde_json::to_string(idx)
+    .map_err(|e| AppError::msg(format!("序列化 JD 筛选索引失败：{}", e)))?;
+  let mut next_id = 0u32;
+  let (jd_masked, m1) = mask_sensitive_segments(jd_text, &mut next_id);
+  let (compact_masked, m2) = mask_sensitive_segments(&compact, &mut next_id);
+  let mut priv_map = m1;
+  priv_map.extend_map(m2);
+  let guard = if priv_map.is_empty() { "" } else { LLM_PLACEHOLDER_GUARD };
   let prompt = format!(
-    "你是简历匹配评估助手。请根据岗位JD与候选人简历打分。\n"
+    "你是简历匹配评估助手。候选人信息以 **JD 筛选索引**（解析阶段预抽取的摘要，已省略部分细节）给出，请仅依据索引与 JD 做匹配评估，勿编造索引中未出现的内容。\n"
   ) +
   "输出要求：只返回 JSON，格式为 {\"score\":0-100,\"matchedKeywords\":[\"...\"],\"totalKeywords\":N}。\n"
   + "评分标准：技能匹配、项目相关性、工作经历相关性。\n"
-  + &format!("JD:\n{}\n", jd_text)
-  + &format!("简历(JSON):\n{}\n", resume_json);
+  + &format!("JD:\n{}\n", jd_masked)
+  + &format!("候选人 JD 筛选索引(JSON)：\n{}\n", compact_masked)
+  + guard;
 
   let llm = LlmSettings::from(settings);
   let json_text = complete_json_prompt(
-    "jd_model_score",
+    "jd_model_score_idx",
     &prompt,
     &llm,
     JsonPromptParams {
@@ -1093,6 +1492,7 @@ fn ai_score_resume_match(resume: &ResumeData, jd_text: &str, settings: &AppSetti
     },
   )
   .map_err(|e| AppError::msg(format!("调用模型评分失败：{}", e)))?;
+  let json_text = unmask_sensitive_segments(&json_text, &priv_map);
   let v: Value = serde_json::from_str(&json_text)
     .map_err(|e| AppError::msg(format!("模型评分 JSON 解析失败：{}", e)))?;
 
@@ -1107,7 +1507,235 @@ fn ai_score_resume_match(resume: &ResumeData, jd_text: &str, settings: &AppSetti
   Ok((score, matched_keywords, total_keywords))
 }
 
-pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: i32) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
+fn ai_score_resume_match(resume: &ResumeData, jd_text: &str, settings: &AppSettings) -> Result<(i32, Vec<String>, usize), AppError> {
+  let resume_json = serde_json::to_string(resume)
+    .map_err(|e| AppError::msg(format!("序列化简历失败：{}", e)))?;
+  let mut next_id = 0u32;
+  let (jd_masked, m1) = mask_sensitive_segments(jd_text, &mut next_id);
+  let (resume_masked, m2) = mask_sensitive_segments(&resume_json, &mut next_id);
+  let mut priv_map = m1;
+  priv_map.extend_map(m2);
+  let guard = if priv_map.is_empty() { "" } else { LLM_PLACEHOLDER_GUARD };
+
+  let prompt = format!(
+    "你是简历匹配评估助手。请根据岗位JD与候选人简历打分。\n"
+  ) +
+  "输出要求：只返回 JSON，格式为 {\"score\":0-100,\"matchedKeywords\":[\"...\"],\"totalKeywords\":N}。\n"
+  + "评分标准：技能匹配、项目相关性、工作经历相关性。\n"
+  + &format!("JD:\n{}\n", jd_masked)
+  + &format!("简历(JSON):\n{}\n", resume_masked)
+  + guard;
+
+  let llm = LlmSettings::from(settings);
+  let json_text = complete_json_prompt(
+    "jd_model_score",
+    &prompt,
+    &llm,
+    JsonPromptParams {
+      temperature: 0.0,
+      ollama_num_ctx: 4096,
+      ollama_num_predict: None,
+    },
+  )
+  .map_err(|e| AppError::msg(format!("调用模型评分失败：{}", e)))?;
+  let json_text = unmask_sensitive_segments(&json_text, &priv_map);
+  let v: Value = serde_json::from_str(&json_text)
+    .map_err(|e| AppError::msg(format!("模型评分 JSON 解析失败：{}", e)))?;
+
+  let score = v.get("score").and_then(|x| x.as_i64()).unwrap_or(0).clamp(0, 100) as i32;
+  let matched_keywords = v
+    .get("matchedKeywords")
+    .and_then(|x| x.as_array())
+    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+    .unwrap_or_default();
+  let total_keywords = v.get("totalKeywords").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+
+  Ok((score, matched_keywords, total_keywords))
+}
+
+fn ai_score_resume_hr_from_jd_index(
+  idx: &JdScreeningIndex,
+  position: &str,
+  jd_text: &str,
+  settings: &AppSettings,
+) -> Result<(i32, crate::schema::JdScoreBreakdown, Vec<String>, usize), AppError> {
+  let compact = serde_json::to_string(idx)
+    .map_err(|e| AppError::msg(format!("序列化 JD 筛选索引失败：{}", e)))?;
+  let mut next_id = 0u32;
+  let (pos_masked, m1) = mask_sensitive_segments(position.trim(), &mut next_id);
+  let (jd_masked, m2) = mask_sensitive_segments(jd_text, &mut next_id);
+  let (compact_masked, m3) = mask_sensitive_segments(&compact, &mut next_id);
+  let mut priv_map = m1;
+  priv_map.extend_map(m2);
+  priv_map.extend_map(m3);
+  let guard = if priv_map.is_empty() { "" } else { LLM_PLACEHOLDER_GUARD };
+  let prompt = format!(
+    "你是企业招聘 HR。候选人信息为 **JD 筛选索引**（解析阶段预抽取，已压缩 token），请在其范围内评估与岗位的匹配度；勿编造索引中未出现的经历或技能。\n\
+岗位：{}\n\
+JD：\n{}\n\
+候选人 JD 筛选索引(JSON)：\n{}\n\
+\n\
+请先判断硬性门槛，再判断工作/项目相关性，最后给结论分。\n\
+仅返回 JSON，格式严格如下：\n\
+{{\n\
+  \"totalScore\": 0-100,\n\
+  \"breakdown\": {{\n\
+    \"skillScore\": 0-100,\n\
+    \"yearsScore\": 0-100,\n\
+    \"degreeScore\": 0-100,\n\
+    \"workScore\": 0-100,\n\
+    \"projectScore\": 0-100\n\
+  }},\n\
+  \"matchedKeywords\": [\"最多12条证据短语\"],\n\
+  \"totalKeywords\": 5\n\
+}}\n\
+要求：分数必须是整数；不要输出 JSON 之外的任何文字。",
+    pos_masked,
+    jd_masked,
+    compact_masked
+  ) + guard;
+
+  let llm = LlmSettings::from(settings);
+  let json_text = complete_json_prompt(
+    "jd_hr_score_idx",
+    &prompt,
+    &llm,
+    JsonPromptParams {
+      temperature: 0.0,
+      ollama_num_ctx: 8192,
+      ollama_num_predict: None,
+    },
+  )
+  .map_err(|e| AppError::msg(format!("调用 HR 评估模型失败：{}", e)))?;
+  let json_text = unmask_sensitive_segments(&json_text, &priv_map);
+  let v: Value = serde_json::from_str(&json_text)
+    .map_err(|e| AppError::msg(format!("HR 评估 JSON 解析失败：{}", e)))?;
+
+  let read_score = |obj: &Value, key: &str| -> i32 {
+    obj
+      .get(key)
+      .and_then(|x| x.as_i64())
+      .unwrap_or(0)
+      .clamp(0, 100) as i32
+  };
+  let total_score = read_score(&v, "totalScore");
+  let b = v.get("breakdown").cloned().unwrap_or(Value::Null);
+  let breakdown = crate::schema::JdScoreBreakdown {
+    skill_score: read_score(&b, "skillScore"),
+    years_score: read_score(&b, "yearsScore"),
+    degree_score: read_score(&b, "degreeScore"),
+    work_score: read_score(&b, "workScore"),
+    project_score: read_score(&b, "projectScore"),
+  };
+  let matched_keywords = v
+    .get("matchedKeywords")
+    .and_then(|x| x.as_array())
+    .map(|arr| {
+      arr
+        .iter()
+        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.trim().is_empty())
+        .take(12)
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  let total_keywords = v.get("totalKeywords").and_then(|x| x.as_u64()).unwrap_or(5) as usize;
+
+  Ok((total_score, breakdown, matched_keywords, total_keywords))
+}
+
+fn ai_score_resume_hr(
+  resume: &ResumeData,
+  position: &str,
+  jd_text: &str,
+  settings: &AppSettings,
+) -> Result<(i32, crate::schema::JdScoreBreakdown, Vec<String>, usize), AppError> {
+  let resume_json = serde_json::to_string(resume)
+    .map_err(|e| AppError::msg(format!("序列化简历失败：{}", e)))?;
+  let mut next_id = 0u32;
+  let (pos_masked, m1) = mask_sensitive_segments(position.trim(), &mut next_id);
+  let (jd_masked, m2) = mask_sensitive_segments(jd_text, &mut next_id);
+  let (resume_masked, m3) = mask_sensitive_segments(&resume_json, &mut next_id);
+  let mut priv_map = m1;
+  priv_map.extend_map(m2);
+  priv_map.extend_map(m3);
+  let guard = if priv_map.is_empty() { "" } else { LLM_PLACEHOLDER_GUARD };
+  let prompt = format!(
+    "你是企业招聘 HR，请按真实筛选流程评估候选人与岗位匹配度。\n\
+岗位：{}\n\
+JD：\n{}\n\
+候选人简历(JSON)：\n{}\n\
+\n\
+请先判断硬性门槛，再判断工作/项目相关性，最后给结论分。\n\
+仅返回 JSON，格式严格如下：\n\
+{{\n\
+  \"totalScore\": 0-100,\n\
+  \"breakdown\": {{\n\
+    \"skillScore\": 0-100,\n\
+    \"yearsScore\": 0-100,\n\
+    \"degreeScore\": 0-100,\n\
+    \"workScore\": 0-100,\n\
+    \"projectScore\": 0-100\n\
+  }},\n\
+  \"matchedKeywords\": [\"最多12条证据短语\"],\n\
+  \"totalKeywords\": 5\n\
+}}\n\
+要求：分数必须是整数；不要输出 JSON 之外的任何文字。",
+    pos_masked,
+    jd_masked,
+    resume_masked
+  ) + guard;
+
+  let llm = LlmSettings::from(settings);
+  let json_text = complete_json_prompt(
+    "jd_hr_score",
+    &prompt,
+    &llm,
+    JsonPromptParams {
+      temperature: 0.0,
+      ollama_num_ctx: 8192,
+      ollama_num_predict: None,
+    },
+  )
+  .map_err(|e| AppError::msg(format!("调用 HR 评估模型失败：{}", e)))?;
+  let json_text = unmask_sensitive_segments(&json_text, &priv_map);
+  let v: Value = serde_json::from_str(&json_text)
+    .map_err(|e| AppError::msg(format!("HR 评估 JSON 解析失败：{}", e)))?;
+
+  let read_score = |obj: &Value, key: &str| -> i32 {
+    obj
+      .get(key)
+      .and_then(|x| x.as_i64())
+      .unwrap_or(0)
+      .clamp(0, 100) as i32
+  };
+  let total_score = read_score(&v, "totalScore");
+  let b = v.get("breakdown").cloned().unwrap_or(Value::Null);
+  let breakdown = crate::schema::JdScoreBreakdown {
+    skill_score: read_score(&b, "skillScore"),
+    years_score: read_score(&b, "yearsScore"),
+    degree_score: read_score(&b, "degreeScore"),
+    work_score: read_score(&b, "workScore"),
+    project_score: read_score(&b, "projectScore"),
+  };
+  let matched_keywords = v
+    .get("matchedKeywords")
+    .and_then(|x| x.as_array())
+    .map(|arr| {
+      arr
+        .iter()
+        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.trim().is_empty())
+        .take(12)
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  let total_keywords = v.get("totalKeywords").and_then(|x| x.as_u64()).unwrap_or(5) as usize;
+
+  Ok((total_score, breakdown, matched_keywords, total_keywords))
+}
+
+pub fn jd_filter_by_model_from_parsed(_position: String, jd_text: String, limit: i32) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
   let index_path = parsed_index_path()?;
   let items: Vec<ParsedResultRecord> = read_json_or_default(&index_path)?;
   let settings = load_settings()?;
@@ -1116,9 +1744,6 @@ pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: 
   let mut out: Vec<ParsedJdScoreRecord> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();
   for item in items {
-    if !parsed_item_matches_position(&item, &position) {
-      continue;
-    }
     if item.json_path.trim().is_empty() {
       continue;
     }
@@ -1128,14 +1753,46 @@ pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: 
       continue;
     }
 
-    let resume: ResumeData = match read_json_or_default(&resume_path) {
-      Ok(v) => v,
-      Err(_) => continue,
+    let jd_path_buf = jd_index_path_for_row(&resume_path, &item.jd_screening_json_path);
+    let index_opt: Option<JdScreeningIndex> = if jd_path_buf.exists() {
+      match read_json_or_default::<JdScreeningIndex>(&jd_path_buf) {
+        Ok(idx)
+          if !idx.summary_for_jd.trim().is_empty()
+            || !idx.skill_tags.is_empty()
+            || !idx.work_bullets.trim().is_empty()
+            || !idx.project_bullets.trim().is_empty() =>
+        {
+          Some(idx)
+        }
+        _ => None,
+      }
+    } else {
+      None
     };
 
-    let (score, matched_keywords, total_keywords) = match ai_score_resume_match(&resume, &jd_text, &settings) {
-      Ok(v) => v,
-      Err(_) => continue,
+    let (score, matched_keywords, total_keywords) = if let Some(ref idx) = index_opt {
+      match ai_score_resume_match_from_jd_index(idx, &jd_text, &settings) {
+        Ok(v) => v,
+        Err(_) => {
+          let resume: ResumeData = match read_json_or_default(&resume_path) {
+            Ok(v) => v,
+            Err(_) => continue,
+          };
+          match ai_score_resume_match(&resume, &jd_text, &settings) {
+            Ok(v) => v,
+            Err(_) => continue,
+          }
+        }
+      }
+    } else {
+      let resume: ResumeData = match read_json_or_default(&resume_path) {
+        Ok(v) => v,
+        Err(_) => continue,
+      };
+      match ai_score_resume_match(&resume, &jd_text, &settings) {
+        Ok(v) => v,
+        Err(_) => continue,
+      }
     };
     let dedupe_key = item
       .resume_id
@@ -1162,6 +1819,7 @@ pub fn jd_filter_by_model_from_parsed(position: String, jd_text: String, limit: 
       work_years: item.work_years,
       skills: item.skills,
       json_path: item.json_path,
+      jd_screening_json_path: item.jd_screening_json_path,
       score,
       score_breakdown: crate::schema::JdScoreBreakdown::default(),
       matched_keywords,
