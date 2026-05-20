@@ -5,8 +5,42 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+
+/// 单次 LLM 调用的 token 消耗记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageRecord {
+  pub created_at: String,
+  pub provider: String,
+  pub model: String,
+  pub label: String,
+  pub prompt_tokens: i64,
+  pub completion_tokens: i64,
+  pub total_tokens: i64,
+}
+
+static TOKEN_USAGE_LOG: Mutex<Vec<TokenUsageRecord>> = Mutex::new(Vec::new());
+
+fn push_token_usage(record: TokenUsageRecord) {
+  if let Ok(mut g) = TOKEN_USAGE_LOG.lock() {
+    g.push(record);
+  }
+}
+
+pub fn drain_token_usage_log() -> Vec<TokenUsageRecord> {
+  let mut g = TOKEN_USAGE_LOG.lock().unwrap_or_else(|e| e.into_inner());
+  std::mem::take(&mut *g)
+}
+
+fn now_epoch_str() -> String {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_secs().to_string())
+    .unwrap_or_else(|_| "0".to_string())
+}
 
 /// 与 `run_ollama_json` 中 Ollama `num_ctx` 保持一致，便于日志对照
 const RESUME_PARSE_NUM_CTX: u32 = 65536;
@@ -53,6 +87,9 @@ pub struct LlmSettings {
   /// 云端 `max_tokens` 上限；见 `AppSettings::cloud_max_output_tokens`。
   #[serde(default, alias = "cloudMaxOutputTokens")]
   pub cloud_max_output_tokens: Option<u32>,
+  /// 禁用云端模型思考/推理模式。
+  #[serde(default)]
+  pub disable_thinking: bool,
 }
 
 impl From<&AppSettings> for LlmSettings {
@@ -65,6 +102,7 @@ impl From<&AppSettings> for LlmSettings {
       llm_provider: s.llm_provider.clone(),
       llm_api_key: s.llm_api_key.clone(),
       cloud_max_output_tokens: s.cloud_max_output_tokens,
+      disable_thinking: s.disable_thinking,
     }
   }
 }
@@ -103,109 +141,79 @@ fn provider_is_volc_ark(raw: &str) -> bool {
   )
 }
 
-fn normalize_deepseek_base_url(input: &str) -> String {
+fn normalize_base_url(input: &str, default_url: &str, default_scheme: &str, suffix: &str) -> String {
   let raw = input.trim();
   let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
-    "https://api.deepseek.com".to_string()
+    default_url.to_string()
   } else if raw.starts_with("http://") || raw.starts_with("https://") {
     raw.trim_end_matches('/').to_string()
   } else {
-    format!("https://{}", raw.trim_end_matches('/'))
+    format!("{}://{}", default_scheme, raw.trim_end_matches('/'))
   };
   let base = base.trim_end_matches('/');
-  if base.to_ascii_lowercase().ends_with("/v1") {
+  if suffix.is_empty() {
+    return base.to_string();
+  }
+  if base.to_ascii_lowercase().ends_with(suffix) {
     base.to_string()
   } else {
-    format!("{}/v1", base)
+    format!("{}{}", base, suffix)
   }
 }
 
-fn deepseek_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+fn normalize_deepseek_base_url(input: &str) -> String {
+  normalize_base_url(input, "https://api.deepseek.com", "https", "/v1")
+}
+
+fn resolve_api_key(
+  settings: &LlmSettings,
+  provider_name: &str,
+  env_var_names: &[&str],
+) -> Result<String, AppError> {
   let from_config = settings.llm_api_key.trim();
   if !from_config.is_empty() {
     return Ok(from_config.to_string());
   }
-  let from_env = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
-  let from_env = from_env.trim();
-  if !from_env.is_empty() {
-    return Ok(from_env.to_string());
+  for key in env_var_names {
+    if let Ok(v) = std::env::var(key) {
+      let v = v.trim();
+      if !v.is_empty() {
+        return Ok(v.to_string());
+      }
+    }
   }
-  Err(AppError::msg(
-    "DeepSeek：请在 app-config.json 中配置 llmApiKey，或设置环境变量 DEEPSEEK_API_KEY",
-  ))
+  Err(AppError::msg(format!(
+    "{}：请在 app-config.json 中配置 llmApiKey，或设置环境变量 {}",
+    provider_name, env_var_names[0]
+  )))
+}
+
+fn deepseek_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+  resolve_api_key(settings, "DeepSeek", &["DEEPSEEK_API_KEY"])
+}
+
+fn dashscope_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+  resolve_api_key(settings, "DashScope", &["DASHSCOPE_API_KEY", "QWEN_API_KEY"])
+}
+
+fn volc_ark_api_key(settings: &LlmSettings) -> Result<String, AppError> {
+  resolve_api_key(settings, "火山方舟", &["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"])
 }
 
 fn normalize_dashscope_base_url(input: &str) -> String {
-  let raw = input.trim();
-  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
-    "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()
-  } else if raw.starts_with("http://") || raw.starts_with("https://") {
-    raw.trim_end_matches('/').to_string()
-  } else {
-    format!("https://{}", raw.trim_end_matches('/'))
-  };
-  let base = base.trim_end_matches('/');
+  let base = normalize_base_url(input, "https://dashscope.aliyuncs.com/compatible-mode/v1", "https", "");
   let lower = base.to_ascii_lowercase();
   if lower.ends_with("/v1") {
-    return base.to_string();
+    return base;
   }
   if lower.ends_with("/compatible-mode") {
     return format!("{}/v1", base);
   }
-  format!("{}/compatible-mode/v1", base)
-}
-
-fn dashscope_api_key(settings: &LlmSettings) -> Result<String, AppError> {
-  let from_config = settings.llm_api_key.trim();
-  if !from_config.is_empty() {
-    return Ok(from_config.to_string());
-  }
-  for key in ["DASHSCOPE_API_KEY", "QWEN_API_KEY"] {
-    if let Ok(v) = std::env::var(key) {
-      let v = v.trim();
-      if !v.is_empty() {
-        return Ok(v.to_string());
-      }
-    }
-  }
-  Err(AppError::msg(
-    "DashScope：请在 app-config.json 中配置 llmApiKey，或设置环境变量 DASHSCOPE_API_KEY",
-  ))
+  format!("{}/compatible-mode/v1", base.trim_end_matches('/'))
 }
 
 fn normalize_volc_ark_base_url(input: &str) -> String {
-  let raw = input.trim();
-  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
-    "https://ark.cn-beijing.volces.com/api/v3".to_string()
-  } else if raw.starts_with("http://") || raw.starts_with("https://") {
-    raw.trim_end_matches('/').to_string()
-  } else {
-    format!("https://{}", raw.trim_end_matches('/'))
-  };
-  let base = base.trim_end_matches('/');
-  if base.to_ascii_lowercase().ends_with("/api/v3") {
-    base.to_string()
-  } else {
-    format!("{}/api/v3", base)
-  }
-}
-
-fn volc_ark_api_key(settings: &LlmSettings) -> Result<String, AppError> {
-  let from_config = settings.llm_api_key.trim();
-  if !from_config.is_empty() {
-    return Ok(from_config.to_string());
-  }
-  for key in ["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"] {
-    if let Ok(v) = std::env::var(key) {
-      let v = v.trim();
-      if !v.is_empty() {
-        return Ok(v.to_string());
-      }
-    }
-  }
-  Err(AppError::msg(
-    "火山方舟：请在 app-config.json 中配置 llmApiKey，或设置环境变量 ARK_API_KEY",
-  ))
+  normalize_base_url(input, "https://ark.cn-beijing.volces.com/api/v3", "https", "/api/v3")
 }
 
 pub fn parse_resume_with_llm(text: &str, settings: &LlmSettings) -> Result<ResumeParseOutput, AppError> {
@@ -440,7 +448,7 @@ fn build_single_stage_resume_prompt(tpl: &str, text: &str, privacy_masked: bool)
 3. 每条工作经历 description 写全职责与要点（有原文依据时尽量充实）。
 4. 项目经历完整抽取；projectAchievements 承载业绩/指标/成果类表述。
 5. basicInfo.skills 须结合经历归纳技术名词，去重，不得凭空捏造。
-6. basicInfo.name 仅填姓名或称呼本身，不得拼接表头词（如「性别」「男」「女」「年龄」「电话」等）；这些内容须写入 gender、age、contact 等对应字段。
+6. basicInfo.name 仅填姓名或称呼本身（2～4 个汉字或完整英文名），严禁填入：电话号码、手机号、邮箱、在职状态（在职/离职/待业/应届）、性别（男/女）、年龄、学历、岗位名称。这些内容必须写入 contact、gender、age 等对应字段，而非姓名。
 7. 严禁混入其他候选人信息。
 
 对 jdScreeningIndex 的要求：
@@ -482,6 +490,107 @@ pub fn complete_json_prompt(
   } else {
     run_ollama_json_params(label, prompt, settings, params)
   }
+}
+
+/// 共享重试 + JSON 提取 + 验证循环。`do_request` 每个 attempt 调用一次，负责发送 HTTP 请求并返回原始响应文本。
+fn run_llm_with_retry_and_validate(
+  label: &str,
+  base_url: &str,
+  provider_name: &str,
+  max_attempts: usize,
+  retry_delay_ms: u64,
+  log_prefix: &str,
+  mut do_request: impl FnMut() -> Result<String, AppError>,
+) -> Result<String, AppError> {
+  let mut last_err: Option<String> = None;
+  for attempt in 1..=max_attempts {
+    let raw_text = match do_request() {
+      Ok(t) => t,
+      Err(e) => {
+        let err_text = e.to_string();
+        last_err = Some(err_text.clone());
+        if attempt < max_attempts {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
+            log_prefix, label, attempt, max_attempts,
+            base_url, err_text, retry_delay_ms
+          );
+          thread::sleep(Duration::from_millis(retry_delay_ms));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
+          log_prefix, label, attempt, max_attempts,
+          base_url, err_text
+        );
+        return Err(e);
+      }
+    };
+
+    let extracted = match extract_json_object(&raw_text) {
+      Some(v) => sanitize_json_control_chars_inside_strings(&v),
+      None => {
+        let err_text = format!(
+          "模型输出中未找到 JSON 对象。原始输出前800字符：{}",
+          clip(&raw_text, 800)
+        );
+        last_err = Some(err_text.clone());
+        if attempt < max_attempts {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 raw_prefix={}",
+            log_prefix, label, attempt, max_attempts,
+            retry_delay_ms, clip(&raw_text, 400)
+          );
+          thread::sleep(Duration::from_millis(retry_delay_ms));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
+          log_prefix, label, clip(&raw_text, 800)
+        );
+        return Err(AppError::msg(err_text));
+      }
+    };
+
+    match serde_json::from_str::<Value>(&extracted) {
+      Ok(_) => return Ok(extracted),
+      Err(e) => {
+        let err_text = format!("模型输出 JSON 语法错误：{}", e);
+        last_err = Some(err_text.clone());
+        if attempt < max_attempts {
+          resume_parse_log!(
+            warn,
+            "{}: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
+            log_prefix, label, attempt, max_attempts,
+            e, retry_delay_ms, clip(&extracted, 400)
+          );
+          thread::sleep(Duration::from_millis(retry_delay_ms));
+          continue;
+        }
+        resume_parse_log!(
+          error,
+          "{}: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
+          log_prefix, label, attempt, max_attempts,
+          e, clip(&extracted, 800)
+        );
+        return Err(AppError::msg(format!(
+          "{}。原始输出前800字符：{}",
+          err_text, clip(&extracted, 800)
+        )));
+      }
+    }
+  }
+
+  Err(AppError::msg(format!(
+    "调用 {} 失败（阶段：{}）：{}",
+    provider_name,
+    label,
+    last_err.unwrap_or_else(|| "未知错误".to_string())
+  )))
 }
 
 fn run_ollama_json(label: &str, prompt: &str, settings: &LlmSettings) -> Result<String, AppError> {
@@ -536,148 +645,61 @@ fn run_ollama_json_params(
     np_log
   );
 
-  let mut last_err: Option<String> = None;
-  for attempt in 1..=OLLAMA_MAX_ATTEMPTS {
-    let result = ureq::post(&endpoint)
-      .set("Content-Type", "application/json")
-      .timeout(Duration::from_secs(timeout_secs))
-      .send_json(body.clone());
-
-    let resp = match result {
-      Ok(resp) => resp,
-      Err(e) => {
-        let err_text = e.to_string();
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
-          resume_parse_log!(
-            warn,
-            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            base_url,
-            err_text,
-            OLLAMA_RETRY_DELAY_MS
-          );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
-        resume_parse_log!(
-          error,
-          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
-          llm_log_prefix(label),
-          label,
-          attempt,
-          OLLAMA_MAX_ATTEMPTS,
-          base_url,
-          err_text
-        );
-        return Err(AppError::msg(format!(
-          "调用 Ollama 失败（阶段：{}，已重试 {} 次）：{}。请确认 Ollama 可访问：{}；若偶发卡住，建议重试本批次。",
-          label,
-          OLLAMA_MAX_ATTEMPTS,
-          err_text,
-          base_url
-        )));
-      }
-    };
-
-    let payload: Value = resp.into_json().map_err(|e| {
-      resume_parse_log!(
-        error,
-        "{}: [{}] 解析 Ollama JSON 响应失败: {}",
-        llm_log_prefix(label),
-        label,
-        e
-      );
-      AppError::msg(format!("解析 Ollama 响应失败：{}", e))
-    })?;
-
-    let raw_text = payload
-      .get("response")
-      .and_then(|v| v.as_str())
-      .ok_or_else(|| {
-        resume_parse_log!(
-          error,
-          "{}: [{}] 响应缺少 response 字段 payload={}",
-          llm_log_prefix(label),
-          label,
-          payload
-        );
-        AppError::msg(format!("Ollama 响应缺少 response 字段：{}", payload))
-      })?;
-
-    let extracted = match extract_json_object(raw_text) {
-      Some(v) => sanitize_json_control_chars_inside_strings(&v),
-      None => {
-        let err_text = format!("模型输出中未找到 JSON 对象。原始输出前800字符：{}", clip(raw_text, 800));
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
-          resume_parse_log!(
-            warn,
-            "{}: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 raw_prefix={}",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            OLLAMA_RETRY_DELAY_MS,
-            clip(raw_text, 400)
-          );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
-        resume_parse_log!(
-          error,
-          "{}: [{}] 无法从模型输出中提取 JSON，raw_prefix={}",
-          llm_log_prefix(label),
-          label,
-          clip(raw_text, 800)
-        );
-        return Err(AppError::msg(err_text));
-      }
-    };
-
-    match serde_json::from_str::<Value>(&extracted) {
-      Ok(_) => return Ok(extracted),
-      Err(e) => {
-        let err_text = format!("模型输出 JSON 语法错误：{}", e);
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
-          resume_parse_log!(
-            warn,
-            "{}: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            e,
-            OLLAMA_RETRY_DELAY_MS,
-            clip(&extracted, 400)
-          );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
-        resume_parse_log!(
-          error,
-          "{}: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
-          llm_log_prefix(label),
-          label,
-          attempt,
-          OLLAMA_MAX_ATTEMPTS,
-          e,
-          clip(&extracted, 800)
-        );
-        return Err(AppError::msg(format!("{}。原始输出前800字符：{}", err_text, clip(&extracted, 800))));
-      }
-    }
-  }
-
-  Err(AppError::msg(format!(
-    "调用 Ollama 失败（阶段：{}）：{}",
+  let log_prefix = llm_log_prefix(label);
+  run_llm_with_retry_and_validate(
     label,
-    last_err.unwrap_or_else(|| "未知错误".to_string())
-  )))
+    &base_url,
+    "Ollama",
+    OLLAMA_MAX_ATTEMPTS,
+    OLLAMA_RETRY_DELAY_MS,
+    log_prefix,
+    || {
+      let resp = ureq::post(&endpoint)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(timeout_secs))
+        .send_json(body.clone())
+        .map_err(|e| {
+          AppError::msg(format!(
+            "调用 Ollama 失败（阶段：{}，已重试 {} 次）：{}。请确认 Ollama 可访问：{}；若偶发卡住，建议重试本批次。",
+            label, OLLAMA_MAX_ATTEMPTS, e, base_url
+          ))
+        })?;
+      let payload: Value = resp.into_json().map_err(|e| {
+        resume_parse_log!(
+          error,
+          "{}: [{}] 解析 Ollama JSON 响应失败: {}",
+          log_prefix, label, e
+        );
+        AppError::msg(format!("解析 Ollama 响应失败：{}", e))
+      })?;
+      // 记录 token 消耗（Ollama）
+      {
+        let prompt_tokens = payload.get("prompt_eval_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let completion_tokens = payload.get("eval_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        push_token_usage(TokenUsageRecord {
+          created_at: now_epoch_str(),
+          provider: "ollama".into(),
+          model: settings.model_path.trim().to_string(),
+          label: label.to_string(),
+          prompt_tokens,
+          completion_tokens,
+          total_tokens: prompt_tokens + completion_tokens,
+        });
+      }
+      payload
+        .get("response")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+          resume_parse_log!(
+            error,
+            "{}: [{}] 响应缺少 response 字段 payload={}",
+            log_prefix, label, payload
+          );
+          AppError::msg(format!("Ollama 响应缺少 response 字段：{}", payload))
+        })
+    },
+  )
 }
 
 fn lmstudio_max_tokens(params: &JsonPromptParams) -> u32 {
@@ -794,7 +816,7 @@ fn run_openai_compatible_json(
   // 简历解析为 resume + jdScreeningIndex 嵌套结构，OpenAI json_schema 约束不适用，统一走 text。
   let structured_stage = false;
   // DeepSeek / DashScope 等当前不支持或不稳定支持 response_format=json_schema，直接走 text。
-  let mut schema_fallback_enabled = matches!(
+  let schema_fallback_enabled = matches!(
     vendor,
     OpenAiCompatVendor::DeepSeek | OpenAiCompatVendor::DashScope | OpenAiCompatVendor::VolcArk
   );
@@ -824,326 +846,199 @@ fn run_openai_compatible_json(
     max_tokens
   );
 
-  let mut last_err: Option<String> = None;
-  for attempt in 1..=OLLAMA_MAX_ATTEMPTS {
-    let response_format = if structured_stage && !schema_fallback_enabled {
-      json!({
-        "type": "json_schema",
-        "json_schema": {
-          "name": schema_name,
-          "strict": true,
-          "schema": resume_json_schema()
+  let log_prefix = llm_log_prefix(label);
+  let schema_fallback = std::cell::Cell::new(schema_fallback_enabled);
+  run_llm_with_retry_and_validate(
+    label,
+    &base_url,
+    vendor_zh,
+    OLLAMA_MAX_ATTEMPTS,
+    OLLAMA_RETRY_DELAY_MS,
+    log_prefix,
+    || {
+      let sf = schema_fallback.get();
+      let response_format = if structured_stage && !sf {
+        json!({
+          "type": "json_schema",
+          "json_schema": {
+            "name": schema_name,
+            "strict": true,
+            "schema": resume_json_schema()
+          }
+        })
+      } else {
+        json!({ "type": "text" })
+      };
+      let mut body_map = serde_json::Map::new();
+      body_map.insert("model".into(), json!(settings.model_path.trim()));
+      body_map.insert("messages".into(), json!([{ "role": "user", "content": prompt }]));
+      body_map.insert("temperature".into(), json!(params.temperature));
+      body_map.insert("max_tokens".into(), json!(max_tokens));
+      body_map.insert("stream".into(), json!(false));
+      body_map.insert("response_format".into(), response_format);
+      if settings.disable_thinking {
+        match vendor {
+          OpenAiCompatVendor::DashScope => {
+            body_map.insert("enable_thinking".into(), json!(false));
+          }
+          OpenAiCompatVendor::DeepSeek | OpenAiCompatVendor::VolcArk => {
+            body_map.insert("thinking".into(), json!({"type": "disabled"}));
+          }
+          _ => {}
         }
-      })
-    } else {
-      json!({ "type": "text" })
-    };
-    let body = json!({
-      "model": settings.model_path.trim(),
-      "messages": [
-        { "role": "user", "content": prompt }
-      ],
-      "temperature": params.temperature,
-      "max_tokens": max_tokens,
-      "stream": false,
-      // OpenAI 兼容：不支持 json_schema 时会自动降级到 text。
-      "response_format": response_format
-    });
-    let mut req_builder = ureq::post(&endpoint)
-      .set("Content-Type", "application/json")
-      .timeout(Duration::from_secs(timeout_secs));
-    if let Some(ref auth) = bearer_header {
-      req_builder = req_builder.set("Authorization", auth.as_str());
-    }
-    let result = req_builder.send_json(body.clone());
-
-    let resp = match result {
-      Ok(resp) => resp,
-      Err(ureq::Error::Status(code, resp)) => {
-        let err_body = resp
-          .into_string()
-          .unwrap_or_else(|_| "<empty error body>".to_string());
-        let err_text = format!("status code {}: {}", code, err_body);
-        if structured_stage && !schema_fallback_enabled && code == 400 {
-          schema_fallback_enabled = true;
-          resume_parse_log!(
-            warn,
-            "{}: [{}] {} 不支持 json_schema，自动降级为 text 后重试；err={}",
-            llm_log_prefix(label),
-            label,
-            vendor_zh,
-            clip(&err_text, 500)
-          );
-          continue;
-        }
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
-          resume_parse_log!(
-            warn,
-            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            base_url,
-            err_text,
-            OLLAMA_RETRY_DELAY_MS
-          );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
-        resume_parse_log!(
-          error,
-          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
-          llm_log_prefix(label),
-          label,
-          attempt,
-          OLLAMA_MAX_ATTEMPTS,
-          base_url,
-          err_text
-        );
-        let hint = match vendor {
-          OpenAiCompatVendor::LmStudio => format!(
-            "请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。",
-            base_url
-          ),
-          OpenAiCompatVendor::DeepSeek => format!(
-            "请确认 llmApiKey / 环境变量 DEEPSEEK_API_KEY 正确，且可访问：{}。",
-            base_url
-          ),
-          OpenAiCompatVendor::DashScope => format!(
-            "请确认 llmApiKey / 环境变量 DASHSCOPE_API_KEY 正确，且可访问：{}（国际区可改 llamaCliPath 为国际 compatible-mode 地址）。",
-            base_url
-          ),
-          OpenAiCompatVendor::VolcArk => format!(
-            "请确认 llmApiKey / 环境变量 ARK_API_KEY 正确，且可访问：{}（其他地域 endpoint 可改 llamaCliPath）。",
-            base_url
-          ),
-        };
-        return Err(AppError::msg(format!(
-          "调用 {} 失败（阶段：{}，已重试 {} 次）：{}。{}",
-          vendor_zh, label, OLLAMA_MAX_ATTEMPTS, err_text, hint
-        )));
       }
-      Err(e) => {
-        let err_text = e.to_string();
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
-          resume_parse_log!(
-            warn,
-            "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}；{}ms 后重试",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            base_url,
-            err_text,
-            OLLAMA_RETRY_DELAY_MS
-          );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
-        resume_parse_log!(
-          error,
-          "{}: [{}] HTTP 请求失败（第{}/{}次）{} err={}",
-          llm_log_prefix(label),
-          label,
-          attempt,
-          OLLAMA_MAX_ATTEMPTS,
-          base_url,
-          err_text
-        );
-        let hint = match vendor {
-          OpenAiCompatVendor::LmStudio => format!(
-            "请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。",
-            base_url
-          ),
-          OpenAiCompatVendor::DeepSeek => format!(
-            "请确认 llmApiKey / 环境变量 DEEPSEEK_API_KEY 正确，且可访问：{}。",
-            base_url
-          ),
-          OpenAiCompatVendor::DashScope => format!(
-            "请确认 llmApiKey / 环境变量 DASHSCOPE_API_KEY 正确，且可访问：{}（国际区可改 llamaCliPath 为国际 compatible-mode 地址）。",
-            base_url
-          ),
-          OpenAiCompatVendor::VolcArk => format!(
-            "请确认 llmApiKey / 环境变量 ARK_API_KEY 正确，且可访问：{}（其他地域 endpoint 可改 llamaCliPath）。",
-            base_url
-          ),
-        };
-        return Err(AppError::msg(format!(
-          "调用 {} 失败（阶段：{}，已重试 {} 次）：{}。{}",
-          vendor_zh, label, OLLAMA_MAX_ATTEMPTS, err_text, hint
-        )));
+      let body = Value::Object(body_map);
+      let mut req_builder = ureq::post(&endpoint)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(timeout_secs));
+      if let Some(ref auth) = bearer_header {
+        req_builder = req_builder.set("Authorization", auth.as_str());
       }
-    };
+      let result = req_builder.send_json(body.clone());
 
-    let payload: Value = resp.into_json().map_err(|e| {
-      resume_parse_log!(
-        error,
-        "{}: [{}] 解析 {} JSON 响应失败: {}",
-        llm_log_prefix(label),
-        label,
-        vendor_zh,
-        e
-      );
-      AppError::msg(format!("解析 {} 响应失败：{}", vendor_zh, e))
-    })?;
+      let resp = match result {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+          let err_body = resp
+            .into_string()
+            .unwrap_or_else(|_| "<empty error body>".to_string());
+          if structured_stage && !sf && code == 400 {
+            schema_fallback.set(true);
+            resume_parse_log!(
+              warn,
+              "{}: [{}] {} 不支持 json_schema，自动降级为 text 后重试；err={}",
+              log_prefix, label, vendor_zh,
+              clip(&format!("status code {}: {}", code, err_body), 500)
+            );
+            return Err(AppError::msg("schema_fallback_retry"));
+          }
+          let hint = match vendor {
+            OpenAiCompatVendor::LmStudio => format!(
+              "请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。", base_url
+            ),
+            OpenAiCompatVendor::DeepSeek => format!(
+              "请确认 llmApiKey / 环境变量 DEEPSEEK_API_KEY 正确，且可访问：{}。", base_url
+            ),
+            OpenAiCompatVendor::DashScope => format!(
+              "请确认 llmApiKey / 环境变量 DASHSCOPE_API_KEY 正确，且可访问：{}（国际区可改 llamaCliPath 为国际 compatible-mode 地址）。", base_url
+            ),
+            OpenAiCompatVendor::VolcArk => format!(
+              "请确认 llmApiKey / 环境变量 ARK_API_KEY 正确，且可访问：{}（其他地域 endpoint 可改 llamaCliPath）。", base_url
+            ),
+          };
+          return Err(AppError::msg(format!(
+            "调用 {} 失败（阶段：{}，已重试 {} 次）：status code {}: {}。{}",
+            vendor_zh, label, OLLAMA_MAX_ATTEMPTS, code, err_body, hint
+          )));
+        }
+        Err(e) => {
+          let hint = match vendor {
+            OpenAiCompatVendor::LmStudio => format!(
+              "请确认已启动本地服务器且地址为：{}（OpenAI 兼容 /v1）；若偶发卡住，建议重试本批次。", base_url
+            ),
+            OpenAiCompatVendor::DeepSeek => format!(
+              "请确认 llmApiKey / 环境变量 DEEPSEEK_API_KEY 正确，且可访问：{}。", base_url
+            ),
+            OpenAiCompatVendor::DashScope => format!(
+              "请确认 llmApiKey / 环境变量 DASHSCOPE_API_KEY 正确，且可访问：{}（国际区可改 llamaCliPath 为国际 compatible-mode 地址）。", base_url
+            ),
+            OpenAiCompatVendor::VolcArk => format!(
+              "请确认 llmApiKey / 环境变量 ARK_API_KEY 正确，且可访问：{}（其他地域 endpoint 可改 llamaCliPath）。", base_url
+            ),
+          };
+          return Err(AppError::msg(format!(
+            "调用 {} 失败（阶段：{}，已重试 {} 次）：{}。{}",
+            vendor_zh, label, OLLAMA_MAX_ATTEMPTS, e, hint
+          )));
+        }
+      };
 
-    if let Some(err) = payload.get("error") {
-      let msg = err.to_string();
-      resume_parse_log!(
-        error,
-        "{}: [{}] {} 返回 error: {}",
-        llm_log_prefix(label),
-        label,
-        vendor_zh,
-        msg
-      );
-      return Err(AppError::msg(format!("{} 返回错误：{}", vendor_zh, msg)));
-    }
-
-    let first_choice = payload
-      .get("choices")
-      .and_then(|c| c.as_array())
-      .and_then(|a| a.first())
-      .ok_or_else(|| {
+      let payload: Value = resp.into_json().map_err(|e| {
         resume_parse_log!(
           error,
-          "{}: [{}] 响应缺少 choices[0] payload={}",
-          llm_log_prefix(label),
-          label,
-          payload
+          "{}: [{}] 解析 {} JSON 响应失败: {}",
+          log_prefix, label, vendor_zh, e
         );
-        AppError::msg(format!("{} 响应缺少 choices[0]：{}", vendor_zh, payload))
+        AppError::msg(format!("解析 {} 响应失败：{}", vendor_zh, e))
       })?;
 
-    let finish_reason = first_choice
-      .get("finish_reason")
-      .and_then(|v| v.as_str())
-      .unwrap_or("");
-    let message = first_choice.get("message").and_then(|m| m.as_object()).ok_or_else(|| {
-      resume_parse_log!(
-        error,
-        "{}: [{}] 响应缺少 choices[0].message payload={}",
-        llm_log_prefix(label),
-        label,
-        payload
-      );
-      AppError::msg(format!(
-        "{} 响应缺少 choices[0].message：{}",
-        vendor_zh, payload
-      ))
-    })?;
-    let content_text = message
-      .get("content")
-      .and_then(|v| v.as_str())
-      .unwrap_or("");
-    let reasoning_text = message
-      .get("reasoning_content")
-      .and_then(|v| v.as_str())
-      .unwrap_or("");
-    let (raw_text, source_field) = if !content_text.trim().is_empty() {
-      (content_text, "content")
-    } else if !reasoning_text.trim().is_empty() {
-      resume_parse_log!(
-        warn,
-        "{}: [{}] content 为空，回退使用 reasoning_content finish_reason={}",
-        llm_log_prefix(label),
-        label,
-        finish_reason
-      );
-      (reasoning_text, "reasoning_content")
-    } else {
-      resume_parse_log!(
-        error,
-        "{}: [{}] message.content 与 reasoning_content 均为空 finish_reason={} payload={}",
-        llm_log_prefix(label),
-        label,
-        finish_reason,
-        payload
-      );
-      return Err(AppError::msg(format!(
-        "{} 响应内容为空（content/reasoning_content 均为空，finish_reason={}）",
-        vendor_zh, finish_reason
-      )));
-    };
-
-    let extracted = match extract_json_object(raw_text) {
-      Some(v) => sanitize_json_control_chars_inside_strings(&v),
-      None => {
-        let err_text = format!("模型输出中未找到 JSON 对象。原始输出前800字符：{}", clip(raw_text, 800));
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
-          resume_parse_log!(
-            warn,
-            "{}: [{}] 无法提取 JSON（第{}/{}次）；{}ms 后重试 source={} finish_reason={} raw_prefix={}",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            OLLAMA_RETRY_DELAY_MS,
-            source_field,
-            finish_reason,
-            clip(raw_text, 400)
-          );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
+      if let Some(err) = payload.get("error") {
+        let msg = err.to_string();
         resume_parse_log!(
           error,
-          "{}: [{}] 无法从模型输出中提取 JSON，source={} finish_reason={} raw_prefix={}",
-          llm_log_prefix(label),
-          label,
-          source_field,
-          finish_reason,
-          clip(raw_text, 800)
+          "{}: [{}] {} 返回 error: {}",
+          log_prefix, label, vendor_zh, msg
         );
-        return Err(AppError::msg(err_text));
+        return Err(AppError::msg(format!("{} 返回错误：{}", vendor_zh, msg)));
       }
-    };
 
-    match serde_json::from_str::<Value>(&extracted) {
-      Ok(_) => return Ok(extracted),
-      Err(e) => {
-        let err_text = format!("模型输出 JSON 语法错误：{}", e);
-        last_err = Some(err_text.clone());
-        if attempt < OLLAMA_MAX_ATTEMPTS {
+      // 记录 token 消耗（OpenAI 兼容云端 API）
+      {
+        let usage = payload.get("usage");
+        let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let total_tokens = usage.and_then(|u| u.get("total_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+        push_token_usage(TokenUsageRecord {
+          created_at: now_epoch_str(),
+          provider: vendor_zh.to_lowercase().replace(" ", "_"),
+          model: settings.model_path.trim().to_string(),
+          label: label.to_string(),
+          prompt_tokens,
+          completion_tokens,
+          total_tokens,
+        });
+      }
+
+      let first_choice = payload
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| {
           resume_parse_log!(
-            warn,
-            "{}: [{}] JSON 语法错误（第{}/{}次）err={}；{}ms 后重试 json_prefix={}",
-            llm_log_prefix(label),
-            label,
-            attempt,
-            OLLAMA_MAX_ATTEMPTS,
-            e,
-            OLLAMA_RETRY_DELAY_MS,
-            clip(&extracted, 400)
+            error,
+            "{}: [{}] 响应缺少 choices[0] payload={}",
+            log_prefix, label, payload
           );
-          thread::sleep(Duration::from_millis(OLLAMA_RETRY_DELAY_MS));
-          continue;
-        }
+          AppError::msg(format!("{} 响应缺少 choices[0]：{}", vendor_zh, payload))
+        })?;
+
+      let finish_reason = first_choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+      let message = first_choice.get("message").and_then(|m| m.as_object()).ok_or_else(|| {
         resume_parse_log!(
           error,
-          "{}: [{}] JSON 语法错误（第{}/{}次）err={} json_prefix={}",
-          llm_log_prefix(label),
-          label,
-          attempt,
-          OLLAMA_MAX_ATTEMPTS,
-          e,
-          clip(&extracted, 800)
+          "{}: [{}] 响应缺少 choices[0].message payload={}",
+          log_prefix, label, payload
         );
-        return Err(AppError::msg(format!("{}。原始输出前800字符：{}", err_text, clip(&extracted, 800))));
-      }
-    }
-  }
+        AppError::msg(format!("{} 响应缺少 choices[0].message：{}", vendor_zh, payload))
+      })?;
+      let content_text = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+      let reasoning_text = message.get("reasoning_content").and_then(|v| v.as_str()).unwrap_or("");
 
-  Err(AppError::msg(format!(
-    "调用 {} 失败（阶段：{}）：{}",
-    vendor_zh,
-    label,
-    last_err.unwrap_or_else(|| "未知错误".to_string())
-  )))
+      if !content_text.trim().is_empty() {
+        Ok(content_text.to_string())
+      } else if !reasoning_text.trim().is_empty() {
+        resume_parse_log!(
+          warn,
+          "{}: [{}] content 为空，回退使用 reasoning_content finish_reason={}",
+          log_prefix, label, finish_reason
+        );
+        Ok(reasoning_text.to_string())
+      } else {
+        resume_parse_log!(
+          error,
+          "{}: [{}] message.content 与 reasoning_content 均为空 finish_reason={} payload={}",
+          log_prefix, label, finish_reason, payload
+        );
+        Err(AppError::msg(format!(
+          "{} 响应内容为空（content/reasoning_content 均为空，finish_reason={}）",
+          vendor_zh, finish_reason
+        )))
+      }
+    },
+  )
 }
 
 fn resume_json_schema() -> Value {
@@ -1217,34 +1112,11 @@ fn resume_json_schema() -> Value {
 }
 
 pub fn normalize_lmstudio_base_url(input: &str) -> String {
-  let raw = input.trim();
-  let base = if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
-    "http://127.0.0.1:1234".to_string()
-  } else if raw.starts_with("http://") || raw.starts_with("https://") {
-    raw.trim_end_matches('/').to_string()
-  } else {
-    format!("http://{}", raw.trim_end_matches('/'))
-  };
-
-  let base = base.trim_end_matches('/');
-  if base.to_ascii_lowercase().ends_with("/v1") {
-    base.to_string()
-  } else {
-    format!("{}/v1", base)
-  }
+  normalize_base_url(input, "http://127.0.0.1:1234", "http", "/v1")
 }
 
 fn normalize_ollama_base_url(input: &str) -> String {
-  let raw = input.trim();
-  if raw.is_empty() || raw.to_ascii_lowercase().ends_with(".exe") {
-    return "http://127.0.0.1:11434".to_string();
-  }
-
-  if raw.starts_with("http://") || raw.starts_with("https://") {
-    return raw.trim_end_matches('/').to_string();
-  }
-
-  format!("http://{}", raw.trim_end_matches('/'))
+  normalize_base_url(input, "http://127.0.0.1:11434", "http", "")
 }
 
 fn looks_like_gguf_path(value: &str) -> bool {
@@ -1669,7 +1541,7 @@ fn filter_work_experience(input: &BTreeMap<String, WorkItem>, text_norm: &str) -
       kept.push(item.clone());
     }
   }
-  to_indexed_work_map(kept)
+  to_indexed_map(kept)
 }
 
 fn filter_project_experience(input: &BTreeMap<String, ProjectItem>, text_norm: &str) -> BTreeMap<String, ProjectItem> {
@@ -1679,7 +1551,7 @@ fn filter_project_experience(input: &BTreeMap<String, ProjectItem>, text_norm: &
       kept.push(item.clone());
     }
   }
-  to_indexed_project_map(kept)
+  to_indexed_map(kept)
 }
 
 fn keep_work_item(item: &WorkItem, text_norm: &str) -> bool {
@@ -1735,15 +1607,7 @@ fn keep_project_item(item: &ProjectItem, text_norm: &str) -> bool {
   false
 }
 
-fn to_indexed_work_map(items: Vec<WorkItem>) -> BTreeMap<String, WorkItem> {
-  let mut out = BTreeMap::new();
-  for (i, item) in items.into_iter().enumerate() {
-    out.insert((i + 1).to_string(), item);
-  }
-  out
-}
-
-fn to_indexed_project_map(items: Vec<ProjectItem>) -> BTreeMap<String, ProjectItem> {
+fn to_indexed_map<T>(items: Vec<T>) -> BTreeMap<String, T> {
   let mut out = BTreeMap::new();
   for (i, item) in items.into_iter().enumerate() {
     out.insert((i + 1).to_string(), item);

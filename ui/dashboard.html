@@ -21,6 +21,7 @@
           <a class="nav-item" data-page="word2pdf" href="#word2pdf">Word 转 PDF</a>
           <a class="nav-item" data-page="settings" href="#settings">AI 配置</a>
           <a class="nav-item" data-page="jd" href="#jd">JD 管理筛选</a>
+          <a class="nav-item" data-page="tokenStats" href="#tokenStats">Token 消耗</a>
         </nav>
       </aside>
 
@@ -45,6 +46,10 @@
             <article class="card stat"><div class="k">匹配中简历</div><div id="statMatching" class="v">0</div></article>
           </div>
 
+          <section class="card" style="margin-top: 0;">
+            <h2>Token 消耗概况</h2>
+            <div id="tokenSummaryContent"><span class="muted">加载中…</span></div>
+          </section>
           <div class="grid-2">
             <section class="card">
               <h2>最近导入</h2>
@@ -195,6 +200,13 @@
                   placeholder="留空则内置上限；≥2048 才生效"
                 />
               </div>
+              <div class="ai-field-row">
+                <label for="aiDisableThinking">disableThinking</label>
+                <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 0.95em;">
+                  <input id="aiDisableThinking" type="checkbox" />
+                  关闭云端模型思考模式（加速结构化提取，适合解析/打分等任务）
+                </label>
+              </div>
               <div class="row" style="margin-top: 16px; flex-wrap: wrap; gap: 10px">
                 <button id="aiSettingsSave" type="button" class="primary">保存并写入 app-config.json</button>
                 <button id="aiSettingsReload" type="button" class="ghost">从磁盘重新加载</button>
@@ -205,7 +217,12 @@
 
         <section class="page" data-page="library">
           <section class="card">
-            <h2>简历库筛选</h2>
+            <div class="row" style="justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap">
+              <h2 style="margin: 0">简历库筛选</h2>
+              <div class="muted" style="font-size: 0.95rem">
+                简历总数：<strong id="libraryTotalCount">0</strong>
+              </div>
+            </div>
             <div class="filters">
               <input id="libraryKeyword" placeholder="关键词搜索（姓名/技能/岗位）" />
               <select id="libraryDegree">
@@ -250,6 +267,15 @@
               <div id="resumeDetailBasic" class="detail-grid muted">请选择简历查看详情。</div>
             </section>
             <section class="card detail-card">
+              <h2>教育经历</h2>
+              <table class="table detail-table">
+                <thead>
+                  <tr><th>期间</th><th>学校</th><th>专业</th><th>学历</th></tr>
+                </thead>
+                <tbody id="resumeDetailEduBody"><tr><td colspan="4" class="muted">暂无教育经历</td></tr></tbody>
+              </table>
+            </section>
+            <section class="card detail-card">
               <h2>工作经历</h2>
               <table class="table detail-table">
                 <thead>
@@ -282,17 +308,9 @@
             <h2>智能筛选</h2>
             <div class="row">
               <input id="jdPositionInput" placeholder="输入岗位（如：Java开发工程师）" />
-              <select id="jdTopN">
-                <option value="5">显示前 5 个</option>
-                <option value="10" selected>显示前 10 个</option>
-                <option value="20">显示前 20 个</option>
-                <option value="50">显示前 50 个</option>
-              </select>
-            </div>
-            <div class="row" style="align-items: center; gap: 0.5rem; flex-wrap: wrap">
-              <label for="jdRerankPool" class="muted">初筛后精排份数</label>
-              <input type="number" id="jdRerankPool" min="1" max="75" value="25" style="width: 4.5rem" />
-              <span class="muted" style="font-size: 0.9em">（1～75，默认 25；与「显示前 N」独立）</span>
+              <label for="jdMinScore" class="muted">最低分数</label>
+              <input type="number" id="jdMinScore" min="0" max="100" value="0" style="width: 4.5rem" />
+              <span class="muted" style="font-size: 0.9em">（0～100，仅显示不低于此分数的结果）</span>
             </div>
             <textarea id="jdInput" placeholder="粘贴 JD 文本…" spellcheck="false"></textarea>
             <div class="row">
@@ -325,7 +343,7 @@
             <h2>标准简历模板生成</h2>
             <div id="tplCandidatePicker" class="mini-card">
               <h3>候选人选择（可多选）</h3>
-              <div id="tplCandidateList" class="muted">请先在上方执行“计算匹配分”，此处将同步展示筛选名单。</div>
+              <div id="tplCandidateList" class="muted">请先在上方执行"计算匹配分"，此处将同步展示筛选名单。</div>
             </div>
             <div class="row">
               <label><input id="tplName" type="checkbox" checked /> 姓名</label>
@@ -333,10 +351,6 @@
               <label><input id="tplAge" type="checkbox" checked /> 年龄</label>
               <label><input id="tplContact" type="checkbox" checked /> 联系方式</label>
               <label><input id="tplSkill" type="checkbox" checked /> 技能</label>
-            </div>
-            <div class="mini-card">
-              <h3>模板预览</h3>
-              <pre id="templatePreview" class="pre">请先在“简历导入 & 解析”完成解析，再来此页面生成预览。</pre>
             </div>
             <div class="row">
               <button id="tplExportPdf" class="primary">导出 PDF</button><button id="tplRegenerate">重新生成</button>
@@ -353,7 +367,31 @@
             <p class="subtext">基于当前 JD 匹配结果生成，便于快速横向比较候选人。</p>
           </section>
           <section class="card">
-            <div id="jdCompareReportContent" class="muted">请先在 JD 页面执行“计算匹配分”，再生成对比报告。</div>
+            <div id="jdCompareReportContent" class="muted">请先在 JD 页面执行"计算匹配分"，再生成对比报告。</div>
+          </section>
+        </section>
+
+        <section class="page" data-page="tokenStats">
+          <section class="card">
+            <h2>累计统计</h2>
+            <div id="tokenStatsTotal" class="muted">加载中…</div>
+          </section>
+          <section class="card">
+            <h2>按模型统计</h2>
+            <div id="tokenStatsModel" class="muted">加载中…</div>
+          </section>
+          <section class="card">
+            <div class="row" style="justify-content: space-between; align-items: center;">
+              <h2 style="margin: 0;">每日消耗</h2>
+              <select id="tokenStatsDays" style="width: auto; min-width: 120px;">
+                <option value="7">最近 7 天</option>
+                <option value="14">最近 14 天</option>
+                <option value="30" selected>最近 30 天</option>
+                <option value="60">最近 60 天</option>
+                <option value="90">最近 90 天</option>
+              </select>
+            </div>
+            <div id="tokenStatsDaily" class="muted" style="margin-top: 12px">加载中…</div>
           </section>
         </section>
 

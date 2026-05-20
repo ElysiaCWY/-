@@ -170,6 +170,9 @@ pub struct JdScoreBreakdown {
   pub degree_score: i32,
   pub work_score: i32,
   pub project_score: i32,
+  /// 模型给出的简要评估理由（150 字以内）
+  #[serde(default)]
+  pub rationale: String,
 }
 
 fn default_llm_provider() -> String {
@@ -204,6 +207,9 @@ pub struct AppSettings {
   /// 云端 OpenAI 兼容请求的 `max_tokens` 上限（可选）。不填则用内置上限；填较小值可缩短「模型允许写出的最长回复」从而往往加快尾段生成，但过长简历 JSON 可能被截断。建议从 8192～12288 试起（≥2048 才生效）。
   #[serde(default)]
   pub cloud_max_output_tokens: Option<u32>,
+  /// 禁用云端模型的思考/推理模式（DeepSeek R1、Qwen3 等）。关闭后可显著加速响应，适合结构化 JSON 提取等不需要推理链的任务。
+  #[serde(default)]
+  pub disable_thinking: bool,
 }
 
 impl Default for AppSettings {
@@ -216,6 +222,7 @@ impl Default for AppSettings {
       llm_provider: default_llm_provider(),
       llm_api_key: String::new(),
       cloud_max_output_tokens: None,
+      disable_thinking: false,
     }
   }
 }

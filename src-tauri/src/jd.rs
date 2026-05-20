@@ -84,7 +84,81 @@ pub fn extract_keywords_v1(jd: &str) -> Vec<String> {
 }
 
 fn contains_keyword(text_lower: &str, kw_lower: &str) -> bool {
-  text_lower.contains(&kw_lower.to_lowercase())
+  word_match(text_lower, &kw_lower.to_lowercase())
+}
+
+/// 判断是否为 CJK 字符（中文、日文汉字等）。
+fn is_cjk(c: char) -> bool {
+  matches!(c,
+    '\u{4E00}'..='\u{9FFF}'
+    | '\u{3400}'..='\u{4DBF}'
+    | '\u{F900}'..='\u{FAFF}'
+    | '\u{2E80}'..='\u{2FDF}'
+  )
+}
+
+/// 对字符串中连续的 CJK 字符序列提取 bigram。
+fn cjk_bigrams(s: &str) -> Vec<String> {
+  let cjk_only: Vec<char> = s.chars().filter(|&c| is_cjk(c)).collect();
+  if cjk_only.len() < 2 {
+    return cjk_only.iter().map(|c| c.to_string()).collect();
+  }
+  cjk_only.windows(2).map(|w| w.iter().collect()).collect()
+}
+
+/// 英文关键词用词边界匹配（避免 Java 命中 JavaScript）。
+fn match_english_keyword(text_lower: &str, kw_lower: &str) -> bool {
+  let mut start = 0usize;
+  while let Some(pos) = text_lower[start..].find(kw_lower) {
+    let abs = start + pos;
+    let before_ok = abs == 0 || {
+      let b = text_lower.as_bytes()[abs - 1];
+      !b.is_ascii_alphanumeric()
+    };
+    let after_pos = abs + kw_lower.len();
+    let after_ok = after_pos >= text_lower.len() || {
+      let b = text_lower.as_bytes()[after_pos];
+      !b.is_ascii_alphanumeric()
+    };
+    if before_ok && after_ok {
+      return true;
+    }
+    start = abs + 1;
+  }
+  false
+}
+
+/// 统一关键词匹配：英文走词边界，中文走 bigram 重叠度。
+fn word_match(text: &str, kw: &str) -> bool {
+  let kw_trim = kw.trim();
+  if kw_trim.is_empty() {
+    return false;
+  }
+  let text_lower = text.to_ascii_lowercase();
+
+  // 包含英文字母 → 词边界匹配
+  if kw_trim.chars().any(|c| c.is_ascii_alphabetic()) {
+    return match_english_keyword(&text_lower, &kw_trim.to_ascii_lowercase());
+  }
+
+  // 纯 CJK 关键词 → bigram 重叠度匹配
+  if kw_trim.chars().all(|c| is_cjk(c) || c.is_ascii_whitespace()) {
+    let kw_clean: String = kw_trim.chars().filter(|&c| !c.is_ascii_whitespace()).collect();
+    if kw_clean.chars().count() <= 1 {
+      return text.contains(&kw_clean);
+    }
+    let kw_bg = cjk_bigrams(&kw_clean);
+    let tx_bg = cjk_bigrams(text);
+    if kw_bg.is_empty() {
+      return text.contains(&kw_clean);
+    }
+    let matched = kw_bg.iter().filter(|b| tx_bg.contains(b)).count();
+    let ratio = matched as f32 / kw_bg.len() as f32;
+    return ratio >= 0.6;
+  }
+
+  // 混合（如 "C++开发"）回退到子串匹配
+  text_lower.contains(&kw_trim.to_ascii_lowercase())
 }
 
 fn weight_of(kw: &str) -> i32 {
@@ -207,6 +281,7 @@ pub fn score_structured_resume(req: &JdStructuredRequirement, resume: &ResumeStr
     degree_score: degree_score_raw,
     work_score: (work_score_raw * 100.0).round() as i32,
     project_score: (project_score_raw * 100.0).round() as i32,
+    rationale: String::new(),
   };
 
   let total = (breakdown.skill_score as f32) * 0.3
@@ -240,7 +315,7 @@ fn normalize_items(items: &[String]) -> Vec<String> {
 fn hit_count(text: &str, kws: &[String], matched: &mut BTreeSet<String>) -> usize {
   let mut count = 0usize;
   for kw in kws {
-    if text.contains(kw) {
+    if word_match(text, kw) {
       count += 1;
       matched.insert(kw.clone());
     }

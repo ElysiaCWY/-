@@ -129,12 +129,65 @@ fn merge_description(a: &str, b: &str) -> String {
   format!("{}\n{}", a, b)
 }
 
-/// 去掉姓名末尾误粘的简历表头词（模型常把「性别」等与姓名写进同一字符串）。
+/// 安全网：如果 unmask 因不可见字符差异等原因未命中，清除残留的 __RM_PRIV_NNNN__ 占位符。
+fn strip_remaining_priv_placeholders(raw: &str) -> String {
+  let s = raw.trim();
+  if s.is_empty() {
+    return String::new();
+  }
+  // 匹配 __RM_PRIV_ 开头、四位数字、__ 结尾的占位符，及其附近可能的额外空白/标点。
+  if let Ok(re) = Regex::new(r"__RM_PRIV_\d{4}__") {
+    let cleaned = re.replace_all(s, "").to_string();
+    let trimmed = cleaned.trim();
+    if !trimmed.is_empty() {
+      return trimmed.to_string();
+    }
+  }
+  // 如果整个名字就是占位符本身（或清理后为空），返回空字符串
+  if s.starts_with("__RM_PRIV_") {
+    return String::new();
+  }
+  s.to_string()
+}
+
+/// 去掉姓名中误粘的电话号码、状态词、表头词（模型常把相邻字段合并到姓名）。
 fn normalize_display_name(raw: &str) -> String {
   let mut s = raw.trim().to_string();
   if s.is_empty() {
     return s;
   }
+
+  // 去掉常见的状态标记（含括号、分隔符等形式）
+  // "朱在职" → "朱", "张三(在职)" → "张三", "李四 - 离职" → "李四"
+  for pat in &["在职", "离职", "待业", "应届", "已离职", "找工作"] {
+    // 带括号包裹
+    for (l, r) in &[("（", "）"), ("(", ")"), ("【", "】"), ("[", "]")] {
+      let wrapped = format!("{}{}{}", l, pat, r);
+      s = s.replace(&wrapped, "");
+    }
+    // 带前导空格或分隔符
+    for sep in &[" - ", " · ", " | ", "，", ",", " "] {
+      if let Some(pos) = s.find(&format!("{}{}", sep, pat)) {
+        s = s[..pos].to_string();
+      }
+    }
+    // 紧贴后缀（无空格）
+    if s.ends_with(pat) && s.as_str() != *pat {
+      s = s[..s.len() - pat.len()].trim_end().to_string();
+    }
+  }
+
+  // 如果像电话号码/数字串（数字占比 > 60%），清空
+  let digit_hyphen = s.chars().filter(|c| c.is_ascii_digit() || *c == '-' || *c == ' ' || *c == '(' || *c == ')').count();
+  if digit_hyphen as f64 / s.chars().count().max(1) as f64 > 0.6 {
+    return String::new();
+  }
+
+  // 去掉仅剩单字指示词（如 "男"、"女"）
+  if matches!(s.trim(), "男" | "女" | "Male" | "Female") {
+    return String::new();
+  }
+
   const SUFFIXES: &[&str] = &[
     " 性别", "性别", " Sex", " Gender",
     " 男", " 女",
@@ -175,6 +228,7 @@ fn normalize_basic(mut b: BasicInfo) -> BasicInfo {
     }
   }
   b.name = normalize_display_name(&b.name);
+  b.name = strip_remaining_priv_placeholders(&b.name);
   b.age = normalize_age(&b.age);
   b.contact = b.contact.trim().to_string();
   b.gender = b.gender.trim().to_string();

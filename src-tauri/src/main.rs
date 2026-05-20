@@ -30,7 +30,7 @@ use tauri::Manager;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct BatchParseItem {
   pub file_path: String,
   pub text: String,
@@ -50,34 +50,48 @@ async fn batch_parse_and_save(
   settings: LlmSettings,
 ) -> Result<Vec<BatchParseResult>, AppError> {
   let mut results = Vec::new();
-  // Here we can either process them in parallel using futures or sequentially.
-  // Given local LLMs often crash on parallel inference, we run them sequentially but do it all in the backend to save IPC overhead and enable continuous processing.
-  let is_parallel = items.len() > 1 && settings.llm_provider.contains("deepseek"); // simplistic heuristic or we just do sequentially
+  // 批处理时并行请求，减少整体耗时；本地 LLM server（Ollama/LM Studio）自身会排队，不会崩溃。
+  let is_parallel = items.len() > 1;
   
   if is_parallel {
-      // For remote we can do it in parallel
-      let mut handles = Vec::new();
-      for item in items {
-          let settings_clone = settings.clone();
-          let fp = item.file_path.clone();
-          let text = item.text.clone();
-          handles.push(tauri::async_runtime::spawn_blocking(move || {
-              let parsed = match llm::parse_resume_with_llm(&text, &settings_clone) {
-                  Ok(p) => p,
-                  Err(e) => return BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) },
-              };
-              let resume = validate::normalize_resume(parsed.resume);
-              let _saved = match storage::save_resume(fp.clone(), resume.clone()) {
-                  Ok(r) => r,
-                  Err(e) => return BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) },
-              };
-              let _ = storage::save_parsed_result_json(fp.clone(), _saved.id, resume, parsed.jd_screening_index);
-              BatchParseResult { file_path: fp, success: true, current_progress: 100, error: None }
-          }));
-      }
-      for handle in handles {
-          if let Ok(res) = handle.await {
-              results.push(res);
+      const BATCH_CONCURRENCY: usize = 8;
+      for chunk in items.chunks(BATCH_CONCURRENCY) {
+          let chunk: Vec<BatchParseItem> = chunk.to_vec();
+          let settings = settings.clone();
+          let chunk_results = tauri::async_runtime::spawn_blocking(move || {
+              let mut out = Vec::new();
+              std::thread::scope(|s| {
+                  let mut handles = Vec::new();
+                  for item in &chunk {
+                      let settings_clone = settings.clone();
+                      let fp = item.file_path.clone();
+                      let text = item.text.clone();
+                      handles.push(s.spawn(move || {
+                          let parsed = match llm::parse_resume_with_llm(&text, &settings_clone) {
+                              Ok(p) => p,
+                              Err(e) => return BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) },
+                          };
+                          let resume = validate::normalize_resume(parsed.resume);
+                          let _saved = match storage::save_resume(fp.clone(), resume.clone()) {
+                              Ok(r) => r,
+                              Err(e) => return BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) },
+                          };
+                          let _ = storage::save_parsed_result_json(fp.clone(), _saved.id, _saved.data, parsed.jd_screening_index);
+                          BatchParseResult { file_path: fp, success: true, current_progress: 100, error: None }
+                      }));
+                  }
+                  for h in handles {
+                      match h.join() {
+                          Ok(r) => out.push(r),
+                          Err(_) => out.push(BatchParseResult { file_path: String::new(), success: false, current_progress: 100, error: Some("worker panicked".into()) }),
+                      }
+                  }
+              });
+              out
+          }).await;
+          match chunk_results {
+              Ok(rs) => results.extend(rs),
+              Err(_) => results.push(BatchParseResult { file_path: String::new(), success: false, current_progress: 100, error: Some("batch task panicked".into()) }),
           }
       }
   } else {
@@ -98,11 +112,12 @@ async fn batch_parse_and_save(
               Ok(r) => r,
               Err(e) => { results.push(BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) }); continue; },
           };
-          let _ = storage::save_parsed_result_json(fp.clone(), _saved.id, resume, parsed.jd_screening_index);
+          let _ = storage::save_parsed_result_json(fp.clone(), _saved.id, _saved.data, parsed.jd_screening_index);
           results.push(BatchParseResult { file_path: fp, success: true, current_progress: 100, error: None });
       }
   }
-  
+
+  let _ = storage::flush_token_usage();
   Ok(results)
 }
 
@@ -140,6 +155,7 @@ async fn parse_resume(text: String, settings: LlmSettings) -> Result<ResumeParse
       e
     ),
   }
+  let _ = storage::flush_token_usage();
   out
 }
 
@@ -185,7 +201,7 @@ async fn jd_filter_by_keywords(
   rerank_pool: i32,
 ) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
   let app_emit = app.clone();
-  tauri::async_runtime::spawn_blocking(move || {
+  let result = tauri::async_runtime::spawn_blocking(move || {
     let app_emit = app_emit.clone();
     let progress: Arc<dyn Fn(storage::JdFilterProgressEvent) + Send + Sync> =
       Arc::new(move |ev: storage::JdFilterProgressEvent| {
@@ -194,8 +210,11 @@ async fn jd_filter_by_keywords(
     storage::jd_filter_by_keywords_from_index(position, jd_text, limit, rerank_pool, Some(progress))
   })
   .await
-  .map_err(|e| AppError::msg(format!("JD 筛选任务异常: {}", e)))?
+  .map_err(|e| AppError::msg(format!("JD 筛选任务异常: {}", e)))??;
+  let _ = storage::flush_token_usage();
+  Ok(result)
 }
+
 
 #[tauri::command]
 async fn jd_filter_by_model(
@@ -203,11 +222,13 @@ async fn jd_filter_by_model(
   jd_text: String,
   limit: i32,
 ) -> Result<Vec<ParsedJdScoreRecord>, AppError> {
-  tauri::async_runtime::spawn_blocking(move || {
+  let result = tauri::async_runtime::spawn_blocking(move || {
     storage::jd_filter_by_model_from_parsed(position, jd_text, limit)
   })
   .await
-  .map_err(|e| AppError::msg(format!("JD 模型筛选任务异常: {}", e)))?
+  .map_err(|e| AppError::msg(format!("JD 模型筛选任务异常: {}", e)))??;
+  let _ = storage::flush_token_usage();
+  Ok(result)
 }
 
 #[tauri::command]
@@ -326,6 +347,21 @@ fn get_jd_screening_index_for_resume(resume_id: String) -> Result<Option<JdScree
   storage::get_jd_screening_index_for_resume(&resume_id)
 }
 
+#[tauri::command]
+fn get_token_stats(limit: Option<usize>) -> Result<storage::TokenStats, AppError> {
+  storage::get_token_stats(limit.unwrap_or(50))
+}
+
+#[tauri::command]
+fn get_token_daily_stats(days: Option<usize>) -> Result<Vec<storage::DailyTokenStat>, AppError> {
+  storage::get_token_daily_stats(days.unwrap_or(30))
+}
+
+#[tauri::command]
+fn get_token_model_stats() -> Result<Vec<storage::ModelTokenStat>, AppError> {
+  storage::get_token_model_stats()
+}
+
 fn main() {
   env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("resume_manager=info"))
     .format_timestamp_millis()
@@ -358,7 +394,10 @@ fn main() {
       word_to_pdf_convert,
       word_to_pdf_default_dirs,
       analyze_resumes_db,
-      get_jd_screening_index_for_resume
+      get_jd_screening_index_for_resume,
+      get_token_stats,
+      get_token_daily_stats,
+      get_token_model_stats
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
