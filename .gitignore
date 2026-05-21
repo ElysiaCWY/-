@@ -27,3 +27,8 @@ test/word/
 .DS_Store
 Thumbs.db
 .vscode/
+
+# Claude Code
+.agents/
+.claude/
+skills-lock.json

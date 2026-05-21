@@ -157,6 +157,11 @@ fn normalize_display_name(raw: &str) -> String {
     return s;
   }
 
+  // 如果包含 @，大概率是邮箱地址被误填到姓名字段，直接清空
+  if s.contains('@') {
+    return String::new();
+  }
+
   // 去掉常见的状态标记（含括号、分隔符等形式）
   // "朱在职" → "朱", "张三(在职)" → "张三", "李四 - 离职" → "李四"
   for pat in &["在职", "离职", "待业", "应届", "已离职", "找工作"] {
@@ -188,6 +193,20 @@ fn normalize_display_name(raw: &str) -> String {
     return String::new();
   }
 
+  // 如果剩余内容主要是 ASCII 字符且不像是正常英文名（长短、大小写），则视为乱码清空
+  let trimmed = s.trim();
+  let ascii_ratio = trimmed.chars().filter(|c| c.is_ascii()).count() as f64 / trimmed.chars().count().max(1) as f64;
+  let has_cjk = trimmed.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c));
+  // 纯 ASCII 但没有大写字母开头（如 "abcd"、"123abc"）→ 不是正常姓名
+  if ascii_ratio > 0.9 && !has_cjk {
+    let has_upper = trimmed.chars().any(|c| c.is_ascii_uppercase());
+    let letter_ratio = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count() as f64 / trimmed.chars().count().max(1) as f64;
+    // 字母占比低（< 50%）或完全没有大写 → 不像正常英文名
+    if letter_ratio < 0.5 || !has_upper {
+      return String::new();
+    }
+  }
+
   const SUFFIXES: &[&str] = &[
     " 性别", "性别", " Sex", " Gender",
     " 男", " 女",
@@ -195,6 +214,11 @@ fn normalize_display_name(raw: &str) -> String {
     " 年龄", " 年纪",
     " 姓名", " 名字", " Name",
     " 电话", " 手机", " 联系方式", " 邮箱",
+    " 先生", " 女士", " 小姐",
+    " 评价", " 备注", " 说明",
+    " 简历", " 个人简历",
+    " 在线", " 离线",
+    " 的简历",
   ];
   let mut changed = true;
   while changed {

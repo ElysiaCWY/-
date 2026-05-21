@@ -62,6 +62,8 @@ pub struct ResumeRecord {
   pub id: String,
   pub created_at: String,
   pub source_file: String,
+  #[serde(default)]
+  pub file_name: String,
   pub data: ResumeData,
 }
 

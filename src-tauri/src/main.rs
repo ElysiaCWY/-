@@ -71,7 +71,12 @@ async fn batch_parse_and_save(
                               Ok(p) => p,
                               Err(e) => return BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) },
                           };
-                          let resume = validate::normalize_resume(parsed.resume);
+                          let mut resume = validate::normalize_resume(parsed.resume);
+                          if resume.basic_info.name.trim().is_empty() {
+                            if let Some(name) = crate::privacy_mask::extract_name_from_text(&text) {
+                              resume.basic_info.name = name;
+                            }
+                          }
                           let _saved = match storage::save_resume(fp.clone(), resume.clone()) {
                               Ok(r) => r,
                               Err(e) => return BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) },
@@ -107,7 +112,12 @@ async fn batch_parse_and_save(
               Err(e) => { results.push(BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) }); continue; },
           };
           
-          let resume = validate::normalize_resume(parsed.resume);
+          let mut resume = validate::normalize_resume(parsed.resume);
+          if resume.basic_info.name.trim().is_empty() {
+            if let Some(name) = crate::privacy_mask::extract_name_from_text(&item.text) {
+              resume.basic_info.name = name;
+            }
+          }
           let _saved = match storage::save_resume(fp.clone(), resume.clone()) {
               Ok(r) => r,
               Err(e) => { results.push(BatchParseResult { file_path: fp, success: false, current_progress: 100, error: Some(e.to_string()) }); continue; },
@@ -128,17 +138,31 @@ async fn extract_text(file_path: String) -> Result<String, AppError> {
   }).await.map_err(|e| AppError::msg(e.to_string()))?
 }
 
+/// LLM 解析 → 归一化 → 复查姓名，若为空则从原文重提。
+fn post_process_resume(parsed: ResumeParseOutput, original_text: &str) -> ResumeParseOutput {
+  let mut resume = validate::normalize_resume(parsed.resume);
+  if resume.basic_info.name.trim().is_empty() {
+    resume_parse_log!(info, "复查：姓名为空，尝试从原文回填");
+    if let Some(fallback_name) = crate::privacy_mask::extract_name_from_text(original_text) {
+      resume_parse_log!(info, "复查：从原文提取姓名成功 -> {}", fallback_name);
+      resume.basic_info.name = fallback_name;
+    } else {
+      resume_parse_log!(warn, "复查：原文中未找到可提取的姓名");
+    }
+  }
+  ResumeParseOutput {
+    resume,
+    jd_screening_index: parsed.jd_screening_index,
+  }
+}
+
 #[tauri::command]
 async fn parse_resume(text: String, settings: LlmSettings) -> Result<ResumeParseOutput, AppError> {
   let text_len = text.chars().count();
   resume_parse_log!(debug, "parse_resume: invoke text_chars={}", text_len);
   let out = tauri::async_runtime::spawn_blocking(move || {
     let parsed = llm::parse_resume_with_llm(&text, &settings)?;
-    let resume = validate::normalize_resume(parsed.resume);
-    Ok(ResumeParseOutput {
-      resume,
-      jd_screening_index: parsed.jd_screening_index,
-    })
+    Ok(post_process_resume(parsed, &text))
   })
   .await
   .map_err(|e| {

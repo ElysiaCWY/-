@@ -219,6 +219,37 @@ fn migrate_to_v3(conn: &Connection) -> Result<(), AppError> {
   Ok(())
 }
 
+/// 从 source_file 路径中提取文件名，回填到 file_name 列（供存量数据迁移）
+fn backfill_file_name(conn: &Connection) -> Result<(), AppError> {
+  let rows: Vec<(String, String)> = {
+    let mut stmt = conn
+      .prepare("SELECT id, source_file FROM resume_library WHERE (file_name IS NULL OR file_name = '') AND source_file != ''")
+      .map_err(|e| AppError::msg(format!("查询待回填 file_name 失败：{}", e)))?;
+    let result: Vec<(String, String)> = stmt
+      .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+      .map_err(|e| AppError::msg(format!("读取待回填记录失败：{}", e)))?
+      .filter_map(|r| r.ok())
+      .collect();
+    result
+  };
+  for (id, source_file) in &rows {
+    let name = std::path::Path::new(source_file)
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or("")
+      .to_string();
+    if !name.is_empty() {
+      conn
+        .execute("UPDATE resume_library SET file_name = ?1 WHERE id = ?2", params![name, id])
+        .map_err(|e| AppError::msg(format!("回填 file_name 失败：{}", e)))?;
+    }
+  }
+  if !rows.is_empty() {
+    log::info!("已从 source_file 回填 {} 条 file_name", rows.len());
+  }
+  Ok(())
+}
+
 /// 读取 JSON 文件内容字符串；文件不存在或无效时返回空字符串。
 fn load_json_file_content(path_str: &str) -> String {
   let p = path_str.trim();
@@ -393,6 +424,9 @@ fn init_resumes_db(conn: &Connection) -> Result<(), AppError> {
     "TEXT NOT NULL DEFAULT ''",
   )?;
   migrate_to_v3(conn)?;
+  add_column_if_missing(conn, "resume_library", "file_name", "TEXT NOT NULL DEFAULT ''")?;
+  // backfill file_name from source_file for existing records
+  backfill_file_name(conn)?;
   Ok(())
 }
 
@@ -572,6 +606,115 @@ fn normalize_contact(contact: &str) -> String {
   }
 }
 
+/// 从联系方式字符串中提取手机号（11 位数字，以 1 开头）。
+fn extract_phone_from_contact(contact: &str) -> Option<String> {
+  let digits: String = contact.chars().filter(|c| c.is_ascii_digit()).collect();
+  if digits.len() >= 11 {
+    // 找到以 '1' 开头的 11 位连续数字
+    for i in 0..=digits.len() - 11 {
+      if digits.as_bytes()[i] == b'1' {
+        return Some(digits[i..i + 11].to_string());
+      }
+    }
+  }
+  None
+}
+
+/// 从联系方式字符串中提取邮箱。
+fn extract_email_from_contact(contact: &str) -> Option<String> {
+  for token in contact.split(|c: char| c == ',' || c == ';' || c == ' ' || c == '\n' || c == '\r') {
+    let t = token.trim();
+    if t.contains('@') && t.contains('.') {
+      return Some(t.to_ascii_lowercase());
+    }
+  }
+  None
+}
+
+/// 加权评分判断两份简历是否同一人。
+/// 阈值 >= 60 视为同一人。
+fn same_person_score(a: &ResumeData, b: &ResumeData) -> i32 {
+  let mut score = 0i32;
+
+  // 1. 手机号匹配（最强信号）
+  if let (Some(ap), Some(bp)) = (
+    extract_phone_from_contact(&a.basic_info.contact),
+    extract_phone_from_contact(&b.basic_info.contact),
+  ) {
+    if ap == bp {
+      score += 60;
+    }
+  }
+
+  // 2. 邮箱匹配
+  if let (Some(ae), Some(be)) = (
+    extract_email_from_contact(&a.basic_info.contact),
+    extract_email_from_contact(&b.basic_info.contact),
+  ) {
+    if ae == be {
+      score += 60;
+    }
+  }
+
+  // 以下信号需要姓名非空且匹配
+  let a_name = a.basic_info.name.trim().to_ascii_lowercase();
+  let b_name = b.basic_info.name.trim().to_ascii_lowercase();
+  if a_name.is_empty() || b_name.is_empty() || a_name != b_name {
+    return score;
+  }
+  score += 10; // 姓名匹配
+
+  // 3. 同名 + 同学校 + 同专业（极大概率为同一人）
+  'edu_major: for ae in &a.basic_info.education {
+    let aschool = ae.school.trim().to_ascii_lowercase();
+    let amajor = ae.major.trim().to_ascii_lowercase();
+    if aschool.is_empty() {
+      continue;
+    }
+    for be in &b.basic_info.education {
+      if be.school.trim().to_ascii_lowercase() == aschool {
+        if !amajor.is_empty() && be.major.trim().to_ascii_lowercase() == amajor {
+          score += 50;
+          break 'edu_major;
+        }
+      }
+    }
+  }
+
+  // 4. 同名 + 同学校（仅学校，没有专业佐证）
+  if score < 60 {
+    // 如果还没达到阈值，加学校分
+    'edu_school: for ae in &a.basic_info.education {
+      let aschool = ae.school.trim().to_ascii_lowercase();
+      if aschool.is_empty() {
+        continue;
+      }
+      for be in &b.basic_info.education {
+        if be.school.trim().to_ascii_lowercase() == aschool {
+          score += 25;
+          break 'edu_school;
+        }
+      }
+    }
+  }
+
+  // 5. 同名 + 同公司（工作经历中的公司名称重叠）
+  'company: for (_ak, av) in &a.work_experience {
+    let acomp = av.company.trim().to_ascii_lowercase();
+    if acomp.is_empty() {
+      continue;
+    }
+    for (_bk, bv) in &b.work_experience {
+      if bv.company.trim().to_ascii_lowercase() == acomp {
+        score += 35;
+        break 'company;
+      }
+    }
+  }
+
+  score
+}
+
 fn identity_key(name: &str, age: &str, contact: &str) -> Option<String> {
   let n = name.trim().to_ascii_lowercase();
   let a = age.trim().to_ascii_lowercase();
@@ -589,36 +732,6 @@ fn fallback_identity_key(name: &str, source_file: &str) -> Option<String> {
     return None;
   }
   Some(format!("{}|{}", n, sf))
-}
-
-/// 检查两份简历是否姓名相同且至少有一条教育经历重叠（学校+专业相同）。
-fn name_education_overlap(a: &ResumeData, b: &ResumeData) -> bool {
-  let na = a.basic_info.name.trim().to_ascii_lowercase();
-  let nb = b.basic_info.name.trim().to_ascii_lowercase();
-  if na.is_empty() || nb.is_empty() || na != nb {
-    return false;
-  }
-  for ea in &a.basic_info.education {
-    let sa = ea.school.trim().to_ascii_lowercase();
-    if sa.is_empty() {
-      continue;
-    }
-    for eb in &b.basic_info.education {
-      let sb = eb.school.trim().to_ascii_lowercase();
-      if sb.is_empty() || sa != sb {
-        continue;
-      }
-      let ma = ea.major.trim().to_ascii_lowercase();
-      let mb = eb.major.trim().to_ascii_lowercase();
-      if ma.is_empty() && mb.is_empty() {
-        return true;
-      }
-      if ma == mb {
-        return true;
-      }
-    }
-  }
-  false
 }
 
 /// 融合两份简历：以 new 为底，old 中非空字段补入，列表字段取并集去重。
@@ -771,7 +884,7 @@ pub fn get_jd_screening_index_for_resume(resume_id: &str) -> Result<Option<JdScr
 pub fn list_resumes() -> Result<Vec<ResumeRecord>, AppError> {
   let conn = open_resumes_db()?;
   let mut stmt = conn
-    .prepare("SELECT id, created_at, source_file, data_json FROM resume_library ORDER BY created_at DESC")
+    .prepare("SELECT id, created_at, source_file, file_name, data_json FROM resume_library ORDER BY created_at DESC")
     .map_err(|e| AppError::msg(format!("查询简历库失败：{}", e)))?;
   let rows = stmt
     .query_map([], |row| {
@@ -779,7 +892,8 @@ pub fn list_resumes() -> Result<Vec<ResumeRecord>, AppError> {
         id: row.get(0)?,
         created_at: row.get(1)?,
         source_file: row.get(2)?,
-        data: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+        file_name: row.get::<_, String>(3).unwrap_or_default(),
+        data: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
       })
     })
     .map_err(|e| AppError::msg(format!("读取简历库失败：{}", e)))?;
@@ -789,21 +903,19 @@ pub fn list_resumes() -> Result<Vec<ResumeRecord>, AppError> {
 
 pub fn save_resume(source_file: String, data: ResumeData) -> Result<ResumeRecord, AppError> {
   let conn = open_resumes_db()?;
-  let source_file_trimmed = source_file.trim().to_string();
-  let name_trimmed = data.basic_info.name.trim().to_string();
-  let new_key = identity_key(&data.basic_info.name, &data.basic_info.age, &data.basic_info.contact);
-  let fallback = fallback_identity_key(&name_trimmed, &source_file_trimmed);
 
-  let existing: Vec<(String, String, ResumeData)> = {
+  let existing: Vec<(String, String, String, String, ResumeData)> = {
     let mut stmt = conn
-      .prepare("SELECT id, source_file, data_json FROM resume_library")
+      .prepare("SELECT id, created_at, source_file, file_name, data_json FROM resume_library")
       .map_err(|e| AppError::msg(format!("查询简历库失败：{}", e)))?;
     let result = stmt
       .query_map([], |row| {
         Ok((
           row.get::<_, String>(0)?,
           row.get::<_, String>(1)?,
-          serde_json::from_str::<ResumeData>(&row.get::<_, String>(2)?).unwrap_or_default(),
+          row.get::<_, String>(2)?,
+          row.get::<_, String>(3).unwrap_or_default(),
+          serde_json::from_str::<ResumeData>(&row.get::<_, String>(4)?).unwrap_or_default(),
         ))
       })
       .map_err(|e| AppError::msg(format!("读取简历库失败：{}", e)))?
@@ -816,54 +928,73 @@ pub fn save_resume(source_file: String, data: ResumeData) -> Result<ResumeRecord
     .unchecked_transaction()
     .map_err(|e| AppError::msg(format!("开启事务失败：{}", e)))?;
 
-  let mut merged_data: Option<ResumeData> = None;
+  let mut primary: Option<ResumeRecord> = None;
 
-  for (id, sf, d) in &existing {
-    // 姓名相同 + 教育经历有交集 → 融合两份简历
-    if name_education_overlap(&data, d) {
-      if merged_data.is_none() {
-        merged_data = Some(merge_resume_data(d, &data));
+  for (id, created_at, sf, file_name, d) in &existing {
+    let score = same_person_score(&data, d);
+    if score >= 60 {
+      if primary.is_none() {
+        // 第一个匹配：UPDATE 现有记录，保留旧元数据，融合数据
+        let merged = merge_resume_data(d, &data);
+        let data_json = serde_json::to_string(&merged)
+          .map_err(|e| AppError::msg(format!("序列化简历数据失败：{}", e)))?;
+        tx
+          .execute(
+            "UPDATE resume_library SET data_json = ?1 WHERE id = ?2",
+            params![data_json, id],
+          )
+          .map_err(|e| AppError::msg(format!("更新简历失败：{}", e)))?;
+        primary = Some(ResumeRecord {
+          id: id.clone(),
+          created_at: created_at.clone(),
+          source_file: sf.clone(),
+          file_name: file_name.clone(),
+          data: merged,
+        });
+      } else {
+        // 额外的匹配（重复导入导致的冗余记录）：直接删除
+        tx
+          .execute("DELETE FROM resume_library WHERE id = ?1", params![id])
+          .map_err(|e| AppError::msg(format!("去重删除失败：{}", e)))?;
       }
-      tx
-        .execute("DELETE FROM resume_library WHERE id = ?1", params![id])
-        .map_err(|e| AppError::msg(format!("去重删除失败：{}", e)))?;
-      continue;
-    }
-
-    let matched = new_key
-      .as_ref()
-      .and_then(|key| identity_key(&d.basic_info.name, &d.basic_info.age, &d.basic_info.contact).map(|k| &k == key))
-      .unwrap_or(false);
-    let fallback_matched = if !matched {
-      fallback
-        .as_ref()
-        .and_then(|key| fallback_identity_key(&d.basic_info.name, sf).map(|k| &k == key))
-        .unwrap_or(false)
-    } else {
-      false
-    };
-    if matched || fallback_matched {
-      tx
-        .execute("DELETE FROM resume_library WHERE id = ?1", params![id])
-        .map_err(|e| AppError::msg(format!("去重删除失败：{}", e)))?;
     }
   }
 
-  let final_data = merged_data.unwrap_or(data);
-  let record = ResumeRecord {
-    id: make_id("resume"),
-    created_at: now_epoch().to_string(),
-    source_file,
-    data: final_data,
+  let record = if let Some(primary) = primary {
+    // 如果新文件不同于旧文件，将新文件路径追加到 source_file 中作为历史记录
+    let new_file_name = std::path::Path::new(source_file.trim())
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or("")
+      .to_string();
+    if !new_file_name.is_empty() && primary.file_name != new_file_name {
+      // 旧 file_name 保持不变，不覆盖（保留第一次导入的文件信息）
+    }
+    primary
+  } else {
+    // 无匹配：插入新记录
+    let file_name = std::path::Path::new(source_file.trim())
+      .file_name()
+      .and_then(|n| n.to_str())
+      .unwrap_or("")
+      .to_string();
+    let record = ResumeRecord {
+      id: make_id("resume"),
+      created_at: now_epoch().to_string(),
+      source_file,
+      file_name,
+      data,
+    };
+    let data_json = serde_json::to_string(&record.data)
+      .map_err(|e| AppError::msg(format!("序列化简历数据失败：{}", e)))?;
+    tx
+      .execute(
+        "INSERT INTO resume_library (id, created_at, source_file, file_name, data_json) VALUES (?1,?2,?3,?4,?5)",
+        params![record.id, record.created_at, record.source_file, record.file_name, data_json],
+      )
+      .map_err(|e| AppError::msg(format!("保存简历失败：{}", e)))?;
+    record
   };
-  let data_json = serde_json::to_string(&record.data)
-    .map_err(|e| AppError::msg(format!("序列化简历数据失败：{}", e)))?;
-  tx
-    .execute(
-      "INSERT INTO resume_library (id, created_at, source_file, data_json) VALUES (?1,?2,?3,?4)",
-      params![record.id, record.created_at, record.source_file, data_json],
-    )
-    .map_err(|e| AppError::msg(format!("保存简历失败：{}", e)))?;
 
   tx
     .commit()
@@ -907,6 +1038,7 @@ fn delete_resume_if_exists(id: &str) -> Result<bool, AppError> {
         id: row.get(0)?,
         created_at: String::new(),
         source_file: row.get(1)?,
+        file_name: String::new(),
         data: serde_json::from_str(&row.get::<_, String>(2)?).unwrap_or_default(),
       })
     }) {
@@ -1056,10 +1188,6 @@ pub fn save_settings(settings: &AppSettings) -> Result<(), AppError> {
 /// 当前将读写的 `app-config.json` 绝对路径（用于界面提示）。
 pub fn app_settings_file_path() -> Result<String, AppError> {
   Ok(settings_path()?.to_string_lossy().into_owned())
-}
-
-fn parsed_record_identity_key(record: &ParsedResultRecord) -> Option<String> {
-  identity_key(&record.candidate_name, &record.age, &record.contact)
 }
 
 fn extract_primary_position(data: &ResumeData) -> String {
@@ -1301,34 +1429,34 @@ pub fn save_parsed_result_json(
     .map_err(|e| AppError::msg(format!("开启事务失败：{}", e)))?;
 
   // Dedup: remove old matching records
-  let new_identity = identity_key(&candidate_name, &age, &contact);
-  let fallback_identity = fallback_identity_key(&candidate_name, &source_file);
   let has_resume_id = !resume_id.trim().is_empty();
 
-  let existing: Vec<ParsedResultRecord> = {
+  #[derive(Default)]
+  struct OldParsedEntry {
+    parsed_id: String,
+    resume_id: Option<String>,
+    candidate_name: String,
+    data_json: String,
+    json_path: String,
+    jd_screening_json_path: String,
+  }
+
+  let existing: Vec<OldParsedEntry> = {
     let mut find_stmt = tx
       .prepare(
-        "SELECT parsed_id, resume_id, source_file, candidate_name, age, contact, json_path, jd_screening_json_path
+        "SELECT parsed_id, resume_id, candidate_name, data_json, json_path, jd_screening_json_path
          FROM parsed_resumes",
       )
       .map_err(|e| AppError::msg(format!("查询解析记录失败：{}", e)))?;
     let result = find_stmt
       .query_map([], |row| {
-        Ok(ParsedResultRecord {
-          id: row.get(0)?,
-          created_at: String::new(),
-          imported_date: String::new(),
-          resume_id: row.get(1)?,
-          source_file: row.get(2)?,
-          candidate_name: row.get(3)?,
-          age: row.get(4)?,
-          contact: row.get(5)?,
-          position: String::new(),
-          degree: String::new(),
-          work_years: String::new(),
-          skills: Vec::new(),
-          json_path: row.get(6)?,
-          jd_screening_json_path: row.get(7)?,
+        Ok(OldParsedEntry {
+          parsed_id: row.get::<_, String>(0)?,
+          resume_id: row.get::<_, Option<String>>(1)?,
+          candidate_name: row.get::<_, String>(2)?,
+          data_json: row.get::<_, String>(3).unwrap_or_default(),
+          json_path: row.get::<_, String>(4)?,
+          jd_screening_json_path: row.get::<_, String>(5)?,
         })
       })
       .map_err(|e| AppError::msg(format!("读取解析记录失败：{}", e)))?
@@ -1339,15 +1467,33 @@ pub fn save_parsed_result_json(
 
   for old in &existing {
     let matched_resume_id = has_resume_id && old.resume_id.as_deref() == Some(resume_id.as_str());
-    let matched_identity = new_identity
-      .as_ref()
-      .and_then(|key| parsed_record_identity_key(old).map(|k| &k == key))
-      .unwrap_or(false);
-    let matched_fallback = fallback_identity
-      .as_ref()
-      .and_then(|key| fallback_identity_key(&old.candidate_name, &old.source_file).map(|k| &k == key))
-      .unwrap_or(false);
-    if matched_resume_id || matched_identity || matched_fallback {
+
+    let matched_by_score = if !matched_resume_id {
+      // 用 same_person_score 判断（需要 data_json 或 fallback 用构造数据）
+      let old_data: ResumeData = if old.data_json.trim().is_empty() {
+        // 旧记录没有 data_json（migration 前的存量数据），用 flat 字段构造
+        ResumeData {
+          basic_info: crate::schema::BasicInfo {
+            name: old.candidate_name.clone(),
+            age: String::new(),
+            contact: String::new(),
+            gender: String::new(),
+            education: Vec::new(),
+            skills: Vec::new(),
+            certificates: Vec::new(),
+          },
+          work_experience: std::collections::BTreeMap::new(),
+          project_experience: std::collections::BTreeMap::new(),
+        }
+      } else {
+        serde_json::from_str(&old.data_json).unwrap_or_default()
+      };
+      same_person_score(&data, &old_data) >= 60
+    } else {
+      true
+    };
+
+    if matched_resume_id || matched_by_score {
       // Clean up old JSON files if they exist (pre-migration data)
       if !old.json_path.trim().is_empty() {
         let _ = fs::remove_file(&old.json_path);
@@ -1360,7 +1506,7 @@ pub fn save_parsed_result_json(
         let _ = fs::remove_file(&old.jd_screening_json_path);
       }
       tx
-        .execute("DELETE FROM parsed_resumes WHERE parsed_id = ?1", params![old.id])
+        .execute("DELETE FROM parsed_resumes WHERE parsed_id = ?1", params![old.parsed_id])
         .map_err(|e| AppError::msg(format!("删除旧解析记录失败：{}", e)))?;
     }
   }

@@ -72,7 +72,7 @@ export async function handleDeleteSelectedResumes() {
 
 export function renderLibraryTable(records) {
   if (!records.length) {
-    libraryTableBody.innerHTML = '<tr><td colspan="10" class="muted">暂无简历数据</td></tr>';
+    libraryTableBody.innerHTML = '<tr><td colspan="11" class="muted">暂无简历数据</td></tr>';
     syncLibrarySelectAllState(records);
     updateLibraryBulkDeleteState();
     return;
@@ -85,8 +85,10 @@ export function renderLibraryTable(records) {
       const workYears = calcWorkYears(r.data?.workExperience || {});
       const importedDate = formatDateFromEpoch(r.createdAt || r.created_at || "");
       const checked = selectedLibraryIds.has(String(r.id)) ? "checked" : "";
+      const fileName = r.fileName || r.sourceFile?.split(/[/\\]/).pop() || "-";
       return `<tr>
         <td><input type="checkbox" class="library-row-check" data-id="${r.id}" ${checked} /></td>
+        <td title="${escapeHtml(r.sourceFile || '')}">${escapeHtml(fileName)}</td>
         <td>${b.name || "-"}</td>
         <td>${b.gender || "-"}</td>
         <td>${b.age || "-"}</td>
@@ -252,7 +254,9 @@ export async function renderResumeDetailPage(rec) {
   const work = rec?.data?.workExperience || {};
   const proj = rec?.data?.projectExperience || {};
 
+  const fileName = rec.fileName || (rec.sourceFile || "").split(/[/\\]/).pop() || "-";
   const basicItems = [
+    ["简历文件", fileName],
     ["姓名", b.name || "-"],
     ["性别", b.gender || "-"],
     ["年龄", b.age || "-"],
