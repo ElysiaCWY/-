@@ -25,6 +25,8 @@ import {
   tplAge,
   tplContact,
   tplSkill,
+  tplThemeDir,
+  tplPreview,
   tplExportPdf,
   tplRegenerate,
   btnScore,
@@ -79,6 +81,7 @@ export function getTemplateExportOptions() {
     includeAge: Boolean(tplAge?.checked),
     includeContact: Boolean(tplContact?.checked),
     includeSkills: Boolean(tplSkill?.checked),
+    themeDir: (tplThemeDir?.value || "").trim(),
   };
 }
 
@@ -528,6 +531,34 @@ export function initJdPage({ onViewDetail } = {}) {
 
   // Template regenerate & export
   tplRegenerate?.addEventListener("click", updateTemplatePreview);
+
+  // Preview
+  tplPreview?.addEventListener("click", async () => {
+    try {
+      const { selectedRecords } = getSelectedTemplateResolvedRecords();
+      if (!selectedRecords.length) {
+        alert("请先选择候选人并生成预览内容。");
+        return;
+      }
+      const item = selectedRecords[0];
+      const jsonPath = String(item.row?.jsonPath || "").trim();
+      const options = getTemplateExportOptions();
+
+      const html = await invoke("preview_resume_html", {
+        jsonPath,
+        resumeObj: item.data,
+        options,
+      });
+      const win = window.open("", "_blank", "width=900,height=700");
+      if (win) {
+        win.document.write(html);
+        win.document.close();
+      }
+    } catch (e) {
+      alert("预览失败：" + String(e));
+    }
+  });
+
   tplExportPdf?.addEventListener("click", async () => {
     try {
       const { selectedRows, selectedRecords } = getSelectedTemplateResolvedRecords();

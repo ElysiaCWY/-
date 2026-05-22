@@ -150,6 +150,63 @@ fn strip_remaining_priv_placeholders(raw: &str) -> String {
   s.to_string()
 }
 
+/// 从 contact 字段中提取手机号/电话和邮箱，丢弃地区、地址、网址等非联系信息。
+fn clean_contact(raw: &str) -> String {
+  let s = raw.trim();
+  if s.is_empty() {
+    return String::new();
+  }
+
+  // 拆分：换行、分号、中文分号、逗号、中文逗号、顿号
+  let segments: Vec<&str> = s
+    .split(|c: char| c == '\n' || c == ';' || c == '；' || c == ',' || c == '，' || c == '、')
+    .map(|seg| seg.trim())
+    .filter(|seg| !seg.is_empty())
+    .collect();
+
+  if segments.is_empty() {
+    return s.to_string();
+  }
+
+  // 提取手机号/电话（含数字和 -）和邮箱
+  let phone_re = regex::Regex::new(r"1[3-9]\d{9}|\d{3,4}[-]\d{7,}|\d{7,}").unwrap();
+  let email_re = regex::Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap();
+
+  let mut contacts: Vec<String> = Vec::new();
+  let mut non_contacts: Vec<String> = Vec::new();
+
+  for seg in &segments {
+    let has_phone = phone_re.is_match(seg);
+    let has_email = email_re.is_match(seg);
+    let has_address = seg.contains('省') || seg.contains('市') || seg.contains('区')
+      || seg.contains('县') || seg.contains('路') || seg.contains('街')
+      || seg.contains('号') || seg.contains('苑') || seg.contains('栋')
+      || seg.contains("单元") || seg.contains("邮编");
+    let has_url = seg.contains("http") || seg.contains("www.");
+    let has_qq = seg.to_lowercase().starts_with("qq") || seg.contains("QQ");
+    let has_salary = seg.contains('薪') || seg.contains('k')
+      || seg.contains('万') || seg.contains('元');
+    let has_status = seg.contains("到岗") || seg.contains("入职")
+      || seg.contains("离职") || seg.contains("在职");
+
+    if has_phone || has_email {
+      contacts.push(seg.to_string());
+    } else if has_address || has_url || has_qq || has_salary || has_status {
+      non_contacts.push(seg.to_string());
+    } else {
+      // 无法判断的保留原样
+      contacts.push(seg.to_string());
+    }
+  }
+
+  if contacts.is_empty() {
+    // 全都像是非联系方式，返回空字符串
+    return String::new();
+  }
+
+  contacts.join("\n")
+}
+
 /// 去掉姓名中误粘的电话号码、状态词、表头词（模型常把相邻字段合并到姓名）。
 fn normalize_display_name(raw: &str) -> String {
   let mut s = raw.trim().to_string();
@@ -254,7 +311,7 @@ fn normalize_basic(mut b: BasicInfo) -> BasicInfo {
   b.name = normalize_display_name(&b.name);
   b.name = strip_remaining_priv_placeholders(&b.name);
   b.age = normalize_age(&b.age);
-  b.contact = b.contact.trim().to_string();
+  b.contact = clean_contact(&b.contact);
   b.gender = b.gender.trim().to_string();
   b.skills = b
     .skills

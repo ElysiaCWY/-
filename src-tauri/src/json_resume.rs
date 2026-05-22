@@ -2,7 +2,7 @@ use crate::schema::ResumeData;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PdfExportOptions {
   pub include_name: bool,
@@ -10,6 +10,9 @@ pub struct PdfExportOptions {
   pub include_age: bool,
   pub include_contact: bool,
   pub include_skills: bool,
+  /// 自定义主题目录名（相对于项目根，如 "jsonresume-theme-flat" 或 "node_modules/jsonresume-theme-elegant"）。空字符串表示使用内置默认主题。
+  #[serde(default)]
+  pub theme_dir: String,
 }
 
 impl Default for PdfExportOptions {
@@ -20,6 +23,7 @@ impl Default for PdfExportOptions {
       include_age: true,
       include_contact: true,
       include_skills: true,
+      theme_dir: String::new(),
     }
   }
 }
@@ -33,7 +37,7 @@ fn safe(v: &str) -> String {
   if s.is_empty() { "-".to_string() } else { s }
 }
 
-pub fn resume_data_to_json_resume(resume: &ResumeData, options: PdfExportOptions) -> Value {
+pub fn resume_data_to_json_resume(resume: &ResumeData, options: &PdfExportOptions) -> Value {
   let b = &resume.basic_info;
 
   let work = {

@@ -204,6 +204,23 @@ fn export_resume_pdf_from_json(
   json_resume_renderer::export_pdf_with_jsonresume(&resume, options.unwrap_or_default(), &out_path)
 }
 
+/// 预览：返回主题渲染后的 HTML 字符串，前端新窗口打开。
+/// 优先从 json_path 读取，若为空则使用 resume_obj（来自数据库）。
+#[tauri::command]
+fn preview_resume_html(
+  json_path: String,
+  resume_obj: ResumeData,
+  options: Option<PdfExportOptions>,
+) -> Result<String, AppError> {
+  let resume = if !json_path.trim().is_empty() {
+    let content = std::fs::read_to_string(&json_path)?;
+    serde_json::from_str(&content)?
+  } else {
+    resume_obj
+  };
+  json_resume_renderer::preview_resume_html(&resume, &options.unwrap_or_default())
+}
+
 #[tauri::command]
 fn jd_score_v1(resume_obj: ResumeData, jd_text: String) -> Result<JdScoreResult, AppError> {
   Ok(jd::score_v1(&resume_obj, &jd_text))
@@ -399,6 +416,7 @@ fn main() {
       export_js,
       export_resume_pdf,
       export_resume_pdf_from_json,
+      preview_resume_html,
       jd_score_v1,
       jd_score_from_local_parsed,
       jd_filter_by_keywords,

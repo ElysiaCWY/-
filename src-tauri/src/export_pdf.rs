@@ -327,7 +327,7 @@ fn sort_map_keys_numeric(keys: impl Iterator<Item = std::string::String>) -> Vec
 }
 
 /// 与前端 `buildTemplateBlock` 对齐的 Markdown 风格纯文本，供无 Node 时使用 `write_resume_pdf` 生成 PDF。
-pub fn resume_data_to_plain_pdf_content(resume: &ResumeData, options: PdfExportOptions) -> String {
+pub fn resume_data_to_plain_pdf_content(resume: &ResumeData, options: &PdfExportOptions) -> String {
   let b = &resume.basic_info;
   let mut lines: Vec<String> = Vec::new();
   let name = inline_clean(&b.name);
@@ -465,7 +465,8 @@ pub fn write_resume_pdf(content: &str, out_path: &str) -> Result<(), AppError> {
   let font = try_load_windows_cjk_font(&mut doc)
     .ok_or_else(|| AppError::msg("未找到可用中文字体，无法生成不乱码 PDF。请确认系统存在微软雅黑/黑体/宋体字体。"))?;
   let lines = parse_and_wrap_lines(content);
-  let page_text_height = 760.0f32;
+  // 留出页眉 (约22mm) 和页脚 (约18mm) 的空间
+  let page_text_height = 700.0f32;
 
   let mut pages: Vec<Vec<RenderLine>> = Vec::new();
   let mut current_page: Vec<RenderLine> = Vec::new();
@@ -487,12 +488,27 @@ pub fn write_resume_pdf(content: &str, out_path: &str) -> Result<(), AppError> {
     pages.push(current_page);
   }
 
-  for page_lines in pages {
+  let total_pages = pages.len();
+  for (page_idx, page_lines) in pages.into_iter().enumerate() {
+    let page_num = page_idx + 1;
     let mut ops: Vec<Op> = Vec::new();
+
+    // ── 页眉 ──
     ops.push(Op::StartTextSection);
-    ops.push(Op::SetTextCursor {
-      pos: Point::new(Mm(16.0), Mm(284.0)),
-    });
+    ops.push(Op::SetTextCursor { pos: Point::new(Mm(16.0), Mm(288.0)) });
+    ops.push(Op::SetFont { font: font.clone(), size: Pt(9.0) });
+    ops.push(Op::SetLineHeight { lh: Pt(12.0) });
+    ops.push(Op::ShowText { items: vec![TextItem::Text("大瀚 — 人才简历".to_string())] });
+    ops.push(Op::AddLineBreak);
+    // 分隔线
+    ops.push(Op::SetFont { font: font.clone(), size: Pt(6.0) });
+    ops.push(Op::SetLineHeight { lh: Pt(8.0) });
+    ops.push(Op::ShowText { items: vec![TextItem::Text("──────────────────────────────────────────────────────────────".to_string())] });
+    ops.push(Op::EndTextSection);
+
+    // ── 正文 ──
+    ops.push(Op::StartTextSection);
+    ops.push(Op::SetTextCursor { pos: Point::new(Mm(16.0), Mm(272.0)) });
     for line in page_lines {
       let line_height = line_height_for(line.kind);
       let extra_gap = if matches!(line.kind, LineKind::H1 | LineKind::H2) {
@@ -513,6 +529,23 @@ pub fn write_resume_pdf(content: &str, out_path: &str) -> Result<(), AppError> {
       ops.push(Op::AddLineBreak);
     }
     ops.push(Op::EndTextSection);
+
+    // ── 页脚 ──
+    ops.push(Op::StartTextSection);
+    ops.push(Op::SetTextCursor { pos: Point::new(Mm(16.0), Mm(12.0)) });
+    ops.push(Op::SetFont { font: font.clone(), size: Pt(8.0) });
+    ops.push(Op::SetLineHeight { lh: Pt(10.0) });
+    ops.push(Op::ShowText { items: vec![TextItem::Text("──────────────────────────────────────────────────────────────".to_string())] });
+    ops.push(Op::AddLineBreak);
+    ops.push(Op::SetFont { font: font.clone(), size: Pt(8.0) });
+    ops.push(Op::ShowText {
+      items: vec![
+        TextItem::Text("大瀚".to_string()),
+        TextItem::Text(format!("                                                              第 {} 页 / 共 {} 页", page_num, total_pages)),
+      ],
+    });
+    ops.push(Op::EndTextSection);
+
     doc.pages.push(PdfPage::new(Mm(210.0), Mm(297.0), ops));
   }
 

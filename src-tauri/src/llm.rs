@@ -415,7 +415,7 @@ fn build_single_stage_resume_prompt(tpl: &str, text: &str, privacy_masked: bool)
   let privacy_block = if privacy_masked {
     r##"
 
-11. 【隐私占位符】简历原文中部分姓名与联系方式已替换为形如 __RM_PRIV_0000__ 的占位符（与明文对应关系仅保存在本机进程内，不写入模型侧持久化）。你在 JSON 的所有字符串中必须 **原样** 使用这些占位符（含下划线与四位数字），不得改写为真实中文/数字/邮箱；basicInfo.name、basicInfo.contact 及 jdScreeningIndex 中凡对应原文敏感处也必须使用同一占位符，不得编造新的真实隐私。
+12. 【隐私占位符】简历原文中部分姓名与联系方式已替换为形如 __RM_PRIV_0000__ 的占位符（与明文对应关系仅保存在本机进程内，不写入模型侧持久化）。你在 JSON 的所有字符串中必须 **原样** 使用这些占位符（含下划线与四位数字），不得改写为真实中文/数字/邮箱；basicInfo.name、basicInfo.contact 及 jdScreeningIndex 中凡对应原文敏感处也必须使用同一占位符，不得编造新的真实隐私。
 "##
   } else {
     ""
@@ -449,12 +449,13 @@ fn build_single_stage_resume_prompt(tpl: &str, text: &str, privacy_masked: bool)
 4. 项目经历完整抽取；projectAchievements 承载业绩/指标/成果类表述。
 5. basicInfo.skills 须结合经历归纳技术名词，去重，不得凭空捏造。
 6. basicInfo.name 仅填姓名或称呼本身（2～4 个汉字或完整英文名），严禁填入：电话号码、手机号、邮箱、在职状态（在职/离职/待业/应届）、性别（男/女）、年龄、学历、岗位名称。这些内容必须写入 contact、gender、age 等对应字段，而非姓名。
-7. 严禁混入其他候选人信息。
+7. basicInfo.contact 仅填入手机号/电话和邮箱（如有多项用换行或分号分隔），严禁填入：省/市/区/县/街道/路/号/苑/栋/单元、详细地址、邮编、QQ号、微信号、个人主页URL、期望薪资、到岗时间等非直接联系方式。
+8. 严禁混入其他候选人信息。
 
 对 jdScreeningIndex 的要求：
-8. 所有内容须能在上方简历原文或 resume 对象中找到依据；不得虚构公司/项目/证书。
-9. 仅返回 JSON 对象，不要 markdown 围栏或解释文字。
-10. 必须输出完整、可解析的 JSON，不得中途截断。
+9. 所有内容须能在上方简历原文或 resume 对象中找到依据；不得虚构公司/项目/证书。
+10. 仅返回 JSON 对象，不要 markdown 围栏或解释文字。
+11. 必须输出完整、可解析的 JSON，不得中途截断。
 {privacy_block}
 简历原文：
 """{text}""""#,
