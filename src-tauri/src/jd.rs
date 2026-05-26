@@ -285,10 +285,10 @@ pub fn score_structured_resume(req: &JdStructuredRequirement, resume: &ResumeStr
   };
 
   let total = (breakdown.skill_score as f32) * 0.3
-    + (breakdown.years_score as f32) * 0.2
+    + (breakdown.years_score as f32) * 0.1
     + (breakdown.degree_score as f32) * 0.1
-    + (breakdown.work_score as f32) * 0.2
-    + (breakdown.project_score as f32) * 0.2;
+    + (breakdown.work_score as f32) * 0.25
+    + (breakdown.project_score as f32) * 0.25;
 
   StructuredScoreResult {
     total_score: total.round().clamp(0.0, 100.0) as i32,

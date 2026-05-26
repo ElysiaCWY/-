@@ -586,12 +586,12 @@ export function initJdPage({ onViewDetail } = {}) {
         const options = getTemplateExportOptions();
         const jsonPath = String(item.row?.jsonPath || "").trim();
         try {
-          if (jsonPath) {
-            await invoke("export_resume_pdf_from_json", { jsonPath, outPath: targetPath, options });
-          } else {
-            const content = buildTemplateBlock(item.data);
-            await invoke("export_resume_pdf", { content, outPath: targetPath });
-          }
+          await invoke("export_resume_pdf_from_json", {
+            jsonPath,
+            resumeObj: item.data,
+            outPath: targetPath,
+            options,
+          });
           ok += 1;
         } catch (err) {
           failed.push(`${fileName}: ${String(err)}`);

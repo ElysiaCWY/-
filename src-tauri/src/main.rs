@@ -193,14 +193,20 @@ fn export_resume_pdf(content: String, out_path: String) -> Result<(), AppError> 
   export_pdf::write_resume_pdf(&content, &out_path)
 }
 
+/// 优先从 json_path 读取，若为空则使用 resume_obj（来自数据库）。
 #[tauri::command]
 fn export_resume_pdf_from_json(
   json_path: String,
+  resume_obj: ResumeData,
   out_path: String,
   options: Option<PdfExportOptions>,
 ) -> Result<(), AppError> {
-  let content = std::fs::read_to_string(&json_path)?;
-  let resume: ResumeData = serde_json::from_str(&content)?;
+  let resume = if !json_path.trim().is_empty() {
+    let content = std::fs::read_to_string(&json_path)?;
+    serde_json::from_str(&content)?
+  } else {
+    resume_obj
+  };
   json_resume_renderer::export_pdf_with_jsonresume(&resume, options.unwrap_or_default(), &out_path)
 }
 
